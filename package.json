@@ -1,0 +1,43 @@
+{
+  "name": "agent-hours",
+  "version": "0.3.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/pmochine/agent-hours.git"
+  },
+  "homepage": "https://github.com/pmochine/agent-hours#readme",
+  "bugs": "https://github.com/pmochine/agent-hours/issues",
+  "description": "Billable hours from your local coding-agent session logs (Claude Code today) — with the three-state split no other tool gives you: hands-on / supervised / AI-autonomous.",
+  "type": "module",
+  "bin": {
+    "agent-hours": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18.11"
+  },
+  "scripts": {
+    "build": "tsc && node scripts/sync-skill.mjs",
+    "test": "npm run build && node --test test/*.test.mjs",
+    "prepublishOnly": "npm run build && node --test test/*.test.mjs"
+  },
+  "keywords": [
+    "claude",
+    "claude-code",
+    "time-tracking",
+    "billing",
+    "freelance",
+    "hours",
+    "cli"
+  ],
+  "author": "Philipp Mochine",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "typescript": "^5.5.0"
+  }
+}

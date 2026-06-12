@@ -1,0 +1,5 @@
+{"type":"user","timestamp":"2026-06-01T10:00:00Z","message":{"role":"user","content":"please fix the bug in foo.ts"}}
+{"type":"assistant","timestamp":"2026-06-01T10:02:00Z","message":{"role":"assistant","content":[{"type":"text","text":"Looking at foo.ts now."}]}}
+{"type":"user","timestamp":"2026-06-01T10:05:00Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu_1","content":"file contents here"}]}}
+{"type":"user","timestamp":"2026-06-01T10:30:00Z","message":{"role":"user","content":[{"type":"text","text":"now add a test for it"}]}}
+{"type":"user","isMeta":true,"timestamp":"2026-06-01T10:31:00Z","message":{"role":"user","content":"meta event, not a real prompt"}}

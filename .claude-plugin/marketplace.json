@@ -1,0 +1,11 @@
+{
+  "name": "agent-hours",
+  "owner": { "name": "Philipp Mochine" },
+  "plugins": [
+    {
+      "name": "agent-hours",
+      "source": ".",
+      "description": "Billable hours & worklog from coding-agent session logs — three-state human/AI split, retroactive, local-only."
+    }
+  ]
+}

@@ -1,0 +1,11 @@
+{"type":"user","promptSource":"typed","timestamp":"2026-06-02T12:00:00Z","message":{"role":"user","content":"build the newsletter popup"}}
+{"type":"assistant","timestamp":"2026-06-02T12:01:00Z","message":{"role":"assistant","content":[{"type":"text","text":"Working on it."},{"type":"tool_use","name":"Edit","input":{"file_path":"/tmp/popup.liquid","old_string":"a","new_string":"b"}}]}}
+{"type":"queue-operation","operation":"enqueue","timestamp":"2026-06-02T12:03:00Z","content":"also make the close button bigger please"}
+{"type":"queue-operation","operation":"enqueue","timestamp":"2026-06-02T12:03:30Z","content":"<task-notification>\n<task-id>xyz</task-id>\n</task-notification>"}
+{"type":"user","promptSource":"queued","timestamp":"2026-06-02T12:04:00Z","message":{"role":"user","content":"also make the close button bigger please"}}
+{"type":"user","promptSource":"system","timestamp":"2026-06-02T12:05:00Z","message":{"role":"user","content":"<task-notification>scheduled run fired</task-notification>"}}
+{"type":"user","isCompactSummary":true,"timestamp":"2026-06-02T12:06:00Z","message":{"role":"user","content":"This session is being continued from a previous conversation."}}
+{"type":"system","subtype":"away_summary","timestamp":"2026-06-02T12:07:00Z","content":"Popup fertig gebaut, Close-Button vergroessert, naechster Schritt: Tests."}
+{"type":"assistant","timestamp":"2026-06-02T12:08:00Z","message":{"role":"assistant","content":[{"type":"tool_use","name":"Bash","input":{"command":"git commit -m \"Add newsletter popup\" && git push"}}]}}
+{"type":"attachment","timestamp":"2026-06-02T12:09:00Z","attachment":{"type":"edited_text_file","filename":"/tmp/popup.liquid","snippet":"..."}}
+{"type":"user","promptSource":"typed","timestamp":"2026-06-02T12:10:00Z","message":{"role":"user","content":"looks good, ship it"}}

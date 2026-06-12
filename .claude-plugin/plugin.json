@@ -1,0 +1,9 @@
+{
+  "name": "agent-hours",
+  "description": "Billable hours & worklog from coding-agent session logs (Claude Code + Codex) — three-state human/AI split, retroactive, local-only.",
+  "version": "0.3.0",
+  "author": { "name": "Philipp Mochine" },
+  "homepage": "https://github.com/pmochine/agent-hours",
+  "license": "MIT",
+  "keywords": ["time-tracking", "billing", "hours", "freelance", "worklog"]
+}

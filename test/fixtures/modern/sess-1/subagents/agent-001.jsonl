@@ -1,0 +1,2 @@
+{"parentUuid":null,"isSidechain":true,"agentId":"001","type":"user","timestamp":"2026-06-02T12:02:00Z","message":{"role":"user","content":"Subagent task: review the popup code for accessibility issues"}}
+{"parentUuid":"x","isSidechain":true,"agentId":"001","type":"assistant","timestamp":"2026-06-02T12:02:30Z","message":{"role":"assistant","content":[{"type":"tool_use","name":"Edit","input":{"file_path":"/tmp/a11y-fix.liquid","old_string":"a","new_string":"b"}}]}}
