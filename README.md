@@ -2,6 +2,8 @@
 
 **Billable hours from your local coding-agent session logs — with the split no other tool gives you: hands-on / supervised / AI-autonomous. Plus an hourly worklog for your invoice attachments.**
 
+![agent-hours demo](https://raw.githubusercontent.com/pmochine/agent-hours/main/docs/demo.gif)
+
 ```
 npx agent-hours --split
 ```
