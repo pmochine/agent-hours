@@ -14,14 +14,25 @@ import csv
 import glob
 import json
 import os
+import re
 import sys
+import unicodedata
 from datetime import datetime, timezone, timedelta
 
 
 def project_to_hash(path: str) -> str:
-    """Wandelt einen Pfad in das von Claude Code verwendete Hash-Format um."""
-    abs_path = os.path.abspath(path)
-    return abs_path.replace(os.sep, "-")
+    """Wandelt einen Pfad in das von Claude Code verwendete Hash-Format um.
+
+    Zwei nicht-offensichtliche Regeln (an echten Ordnern verifiziert):
+    1. Claude Code ersetzt JEDES Nicht-Alphanumerische Zeichen durch "-" (nicht
+       nur den Pfadtrenner): "manuel-mühlhoffs-bot" -> "manuel-m-hlhoffs-bot".
+    2. macOS liefert Pfade in NFD-Form (das "ü" kommt zerlegt als "u" +
+       kombinierender Akzent), Claude Code legt den Ordner aber in NFC an. Ohne
+       vorheriges NFC-Normalisieren bleibt das "u" als "mu-" stehen und der
+       Ordner wird verfehlt.
+    """
+    abs_path = unicodedata.normalize("NFC", os.path.abspath(path))
+    return re.sub(r"[^a-zA-Z0-9]", "-", abs_path)
 
 
 def parse_date(s: str) -> datetime:

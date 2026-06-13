@@ -226,3 +226,18 @@ test("parseDate handles the three accepted formats", () => {
 test("projectToHash matches Claude Code's directory naming", () => {
   assert.equal(projectToHash("/Users/x/code/foo"), "-Users-x-code-foo");
 });
+
+test("projectToHash sanitizes every non-alphanumeric char (regression: umlauts)", () => {
+  // Claude Code replaces EVERY non-alphanumeric with "-", not just "/".
+  // Build the path from code points so the source stays pure ASCII.
+  const u = String.fromCharCode(0x00fc); // ü (NFC, single code point)
+  const base = `/Users/shadrix/Documents/Coding/Cofana/manuel-m${u}hlhoffs-bot`;
+  const want = "-Users-shadrix-Documents-Coding-Cofana-manuel-m-hlhoffs-bot";
+  // NFC input (composed ü = U+00FC)
+  assert.equal(projectToHash(base.normalize("NFC")), want);
+  // NFD input (decomposed ü = u + U+0308) — what macOS process.cwd() returns.
+  // Must normalize to NFC first, else the "u" survives as "mu-".
+  assert.equal(projectToHash(base.normalize("NFD")), want);
+  assert.equal(projectToHash("/x/my.repo"), "-x-my-repo");
+  assert.equal(projectToHash("/x/a b"), "-x-a-b"); // space -> dash
+});

@@ -37,9 +37,18 @@ export interface Pause {
 
 export const PROJECTS_BASE = path.join(os.homedir(), ".claude", "projects");
 
-/** /Users/x/code/foo -> -Users-x-code-foo (Claude Code's project dir naming). */
+/**
+ * /Users/x/code/foo -> -Users-x-code-foo (Claude Code's project dir naming).
+ * Two non-obvious rules, both verified against real dirs:
+ *  1. Claude Code replaces EVERY non-alphanumeric character with "-", not just
+ *     path separators — so "manuel-mühlhoffs-bot" -> "manuel-m-hlhoffs-bot".
+ *  2. macOS hands paths to a process in NFD form (the "ü" arrives decomposed
+ *     as "u" + combining diaeresis), but Claude Code stores the dir in NFC.
+ *     Without normalizing first, the decomposed "u" survives as "mu-" and the
+ *     folder is missed. Normalize to NFC before sanitizing.
+ */
 export function projectToHash(p: string): string {
-  return path.resolve(p).split(path.sep).join("-");
+  return path.resolve(p).normalize("NFC").replace(/[^a-zA-Z0-9]/g, "-");
 }
 
 export function findProjectDir(projectArg?: string): string {
