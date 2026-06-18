@@ -18,7 +18,7 @@ import {
 } from "../dist/core.js";
 import { collectWorklog, describeLog, mergeLogs } from "../dist/worklog.js";
 import { loadCodexSessions } from "../dist/sources/codex.js";
-import { runInstall, SKILL_MD } from "../dist/install.js";
+import { runInstall, SKILL_MD, checkRetention, setRetention } from "../dist/install.js";
 import fs from "node:fs";
 import os from "node:os";
 
@@ -205,6 +205,48 @@ test("install: writes skills, skips missing codex, is idempotent", () => {
     results = runInstall("all", home);
     assert.equal(results[0].status, "updated");
     assert.equal(results[1].status, "installed");
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("retention: check + set with backup, never lowers, refuses bad JSON", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "ah-ret-"));
+  const settings = path.join(home, ".claude", "settings.json");
+  try {
+    // unset → not sufficient
+    assert.equal(checkRetention(home).current, null);
+    assert.equal(checkRetention(home).sufficient, false);
+
+    // setting on a missing file creates it
+    let r = setRetention(365, home);
+    assert.equal(r.ok, true);
+    assert.equal(r.previous, null);
+    assert.equal(checkRetention(home).current, 365);
+    assert.equal(checkRetention(home).sufficient, true);
+
+    // preserves other keys + writes a backup when a file already exists
+    fs.writeFileSync(settings, JSON.stringify({ language: "German", cleanupPeriodDays: 30 }));
+    r = setRetention(365, home);
+    assert.equal(r.ok, true);
+    assert.equal(r.previous, 30);
+    assert.ok(fs.existsSync(r.backupPath));
+    const after = JSON.parse(fs.readFileSync(settings, "utf8"));
+    assert.equal(after.cleanupPeriodDays, 365);
+    assert.equal(after.language, "German");
+
+    // never lowers an already-higher value
+    fs.writeFileSync(settings, JSON.stringify({ cleanupPeriodDays: 999 }));
+    r = setRetention(365, home);
+    assert.equal(r.ok, true);
+    assert.equal(JSON.parse(fs.readFileSync(settings, "utf8")).cleanupPeriodDays, 999);
+
+    // refuses to clobber invalid JSON
+    fs.writeFileSync(settings, "{ not json");
+    r = setRetention(365, home);
+    assert.equal(r.ok, false);
+    assert.match(r.error, /not valid JSON/);
+    assert.equal(fs.readFileSync(settings, "utf8"), "{ not json");
   } finally {
     fs.rmSync(home, { recursive: true, force: true });
   }

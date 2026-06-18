@@ -57,10 +57,11 @@ Existing tools don't answer this:
 **Level 1 — one command, then talk naturally:**
 
 ```bash
-npx agent-hours install        # drops a skill into ~/.claude and ~/.codex
+npx agent-hours install        # drops a skill into ~/.claude and ~/.codex,
+                               # and offers to raise Claude's log retention
 ```
 
-From then on, questions like *"What did I work on this week?"* or *"Export a CSV of my June hours for the invoice"* just work — your agent runs the CLI and interprets the band for you.
+From then on, questions like *"What did I work on this week?"* or *"Export a CSV of my June hours for the invoice"* just work — your agent runs the CLI and interprets the band for you. The installer also checks that Claude Code keeps logs long enough to bill against (see [retention](#retroactive-use--log-retention)).
 
 **Level 2 — Claude Code plugin** (this repo doubles as one):
 
@@ -127,8 +128,10 @@ Adding an agent = one adapter file that yields `{timestamp, kind: prompt|work, p
 
 Everything works retroactively — **as long as the logs are still on disk**:
 
-- **Claude Code** prunes old transcripts after `cleanupPeriodDays` (default: 30 days). For billing, raise it in `~/.claude/settings.json`: `{"cleanupPeriodDays": 365}` — do this *before* you need last quarter's hours.
+- **Claude Code** prunes old transcripts after `cleanupPeriodDays` (default: **30 days**). For billing you almost certainly want more. `npx agent-hours install` checks this for you and offers to raise it to 365 days (or set it yourself in `~/.claude/settings.json`: `{"cleanupPeriodDays": 365}`). Do it *before* you need last quarter's hours — once a transcript is pruned, it's gone.
 - **Codex CLI** keeps sessions indefinitely (date-partitioned folders).
+
+The `install` command never changes your settings silently: in an interactive terminal it asks first; when an agent runs it, it only prints the recommendation. Use `--set-retention` to apply it non-interactively or `--no-retention` to skip the check.
 
 Rule of thumb: run your exports when you invoice, archive the CSV/JSON next to the invoice, and you're audit-proof regardless of retention.
 

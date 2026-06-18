@@ -60,6 +60,102 @@ export interface InstallResult {
   reason?: string;
 }
 
+/**
+ * Long enough to cover quarterly/yearly retroactive billing. Claude Code's
+ * default of 30 days silently prunes transcripts — by the time you invoice
+ * last quarter, the raw data is gone.
+ */
+export const RECOMMENDED_RETENTION_DAYS = 365;
+
+export interface RetentionStatus {
+  settingsPath: string;
+  exists: boolean;
+  /** cleanupPeriodDays as currently configured (null = unset → 30-day default) */
+  current: number | null;
+  sufficient: boolean;
+}
+
+/** Reads ~/.claude/settings.json and reports the cleanupPeriodDays state. */
+export function checkRetention(homeDir: string = os.homedir()): RetentionStatus {
+  const settingsPath = path.join(homeDir, ".claude", "settings.json");
+  let current: number | null = null;
+  let exists = false;
+  try {
+    const raw = fs.readFileSync(settingsPath, "utf8");
+    exists = true;
+    const v = (JSON.parse(raw) as Record<string, unknown>)["cleanupPeriodDays"];
+    if (typeof v === "number") current = v;
+  } catch {
+    /* missing or unparseable → treat as unset */
+  }
+  return {
+    settingsPath,
+    exists,
+    current,
+    sufficient: current !== null && current >= RECOMMENDED_RETENTION_DAYS,
+  };
+}
+
+export interface SetRetentionResult {
+  ok: boolean;
+  settingsPath: string;
+  previous: number | null;
+  backupPath?: string;
+  error?: string;
+}
+
+/**
+ * Safely sets cleanupPeriodDays in ~/.claude/settings.json. Never lowers an
+ * existing higher value. Backs the file up first; bails (without writing) if
+ * the existing file isn't valid JSON, so we never clobber a user's config.
+ */
+export function setRetention(
+  days: number = RECOMMENDED_RETENTION_DAYS,
+  homeDir: string = os.homedir()
+): SetRetentionResult {
+  const settingsPath = path.join(homeDir, ".claude", "settings.json");
+  let settings: Record<string, unknown> = {};
+  let previous: number | null = null;
+  let raw: string | null = null;
+  try {
+    raw = fs.readFileSync(settingsPath, "utf8");
+  } catch {
+    /* file doesn't exist yet — we'll create it */
+  }
+  if (raw !== null) {
+    try {
+      settings = JSON.parse(raw) as Record<string, unknown>;
+    } catch {
+      return {
+        ok: false,
+        settingsPath,
+        previous: null,
+        error: "settings.json is not valid JSON — not touching it. Set cleanupPeriodDays manually.",
+      };
+    }
+    const v = settings["cleanupPeriodDays"];
+    if (typeof v === "number") previous = v;
+  }
+  if (previous !== null && previous >= days) {
+    return { ok: true, settingsPath, previous };
+  }
+
+  let backupPath: string | undefined;
+  try {
+    if (raw !== null) {
+      backupPath = settingsPath + ".bak";
+      fs.writeFileSync(backupPath, raw);
+    } else {
+      fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+    }
+    settings["cleanupPeriodDays"] = days;
+    fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + "\n");
+    return { ok: true, settingsPath, previous, backupPath };
+  } catch (e) {
+    return { ok: false, settingsPath, previous, error: (e as Error).message };
+  }
+}
+
 function installSkillFile(skillDir: string): InstallResult {
   const target = path.join(skillDir, "agent-hours", "SKILL.md");
   const existed = fs.existsSync(target);

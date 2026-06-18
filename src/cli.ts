@@ -36,15 +36,22 @@ import {
   mergeLogs,
   shortPath,
 } from "./worklog.js";
+import * as readline from "node:readline/promises";
 import { CODEX_SESSIONS_BASE, loadCodexSessions } from "./sources/codex.js";
-import { runInstall } from "./install.js";
+import {
+  RECOMMENDED_RETENTION_DAYS,
+  checkRetention,
+  runInstall,
+  setRetention,
+} from "./install.js";
 
 const HELP = `agent-hours — billable hours from coding-agent session logs
 
 Usage:
   npx agent-hours install            integrate with your agents (one shot):
                                      drops a skill so you can just ask
-                                     "what did I work on this week?"
+                                     "what did I work on this week?", and
+                                     offers to raise Claude's log retention
   npx agent-hours                    current project, cap overview
   npx agent-hours --split            hands-on / supervised / AI-autonomous
   npx agent-hours --by-day --split   per-day table with split
@@ -76,6 +83,8 @@ Options:
   --pauses               list longest pauses (> cap)
   --top-pauses <n>       how many pauses to list (default: 10)
   --all-projects         scan every project under ~/.claude/projects
+  --set-retention        (with install) set cleanupPeriodDays=365 without asking
+  --no-retention         (with install) skip the log-retention check
   -h, --help             this help
   -v, --version          version
 
@@ -101,7 +110,56 @@ function hhmm(minutes: number): string {
   return `${Math.floor(m / 60)}:${String(m % 60).padStart(2, "0")}`;
 }
 
-function main(): void {
+/**
+ * After install, make sure Claude Code keeps logs long enough to bill against.
+ * Interactive (real TTY): ask before changing the user's settings.json.
+ * Non-interactive (agent-invoked): never touch settings silently — just warn.
+ * Flags: --set-retention forces it, --no-retention skips the check.
+ */
+async function ensureRetention(force: boolean, skip: boolean): Promise<void> {
+  if (skip) return;
+  const status = checkRetention();
+  console.log();
+  if (status.sufficient) {
+    console.log(`Log retention: cleanupPeriodDays = ${status.current} days — good for retroactive billing.`);
+    return;
+  }
+
+  const have = status.current === null ? "unset (Claude Code prunes after 30 days)" : `${status.current} days`;
+  console.log(`⚠  Log retention is ${have}.`);
+  console.log(`   agent-hours can only look as far back as your logs survive. For`);
+  console.log(`   quarterly/yearly invoicing, ${RECOMMENDED_RETENTION_DAYS} days is recommended.`);
+
+  const apply = () => {
+    const r = setRetention(RECOMMENDED_RETENTION_DAYS);
+    if (r.ok) {
+      console.log(`   ✓ Set cleanupPeriodDays = ${RECOMMENDED_RETENTION_DAYS} in ${r.settingsPath}` + (r.backupPath ? ` (backup: ${r.backupPath})` : ""));
+    } else {
+      console.log(`   ✗ Could not update settings: ${r.error}`);
+    }
+  };
+
+  if (force) {
+    apply();
+    return;
+  }
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    // Agent-invoked / piped: do not modify the user's config behind their back.
+    console.log(`   To enable: agent-hours install --set-retention`);
+    console.log(`   Or add "cleanupPeriodDays": ${RECOMMENDED_RETENTION_DAYS} to ~/.claude/settings.json`);
+    return;
+  }
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    const answer = (await rl.question(`   Set it to ${RECOMMENDED_RETENTION_DAYS} now? [y/N] `)).trim().toLowerCase();
+    if (answer === "y" || answer === "yes") apply();
+    else console.log(`   Skipped. You can set it later with: agent-hours install --set-retention`);
+  } finally {
+    rl.close();
+  }
+}
+
+async function main(): Promise<void> {
   let args;
   let positionals: string[] = [];
   try {
@@ -126,6 +184,8 @@ function main(): void {
         pauses: { type: "boolean", default: false },
         "top-pauses": { type: "string", default: "10" },
         "all-projects": { type: "boolean", default: false },
+        "set-retention": { type: "boolean", default: false },
+        "no-retention": { type: "boolean", default: false },
         help: { type: "boolean", short: "h", default: false },
         version: { type: "boolean", short: "v", default: false },
       },
@@ -145,6 +205,9 @@ function main(): void {
       if (r.status === "skipped") console.log(`- skipped: ${r.reason}`);
       else console.log(`- ${r.status}: ${r.path}`);
     }
+
+    await ensureRetention(args["set-retention"], args["no-retention"]);
+
     console.log();
     console.log("Done. Now just ask your agent things like:");
     console.log(`  "How many hours did I work on this project last week?"`);
@@ -795,4 +858,4 @@ function runAllProjects(
   console.log(`  ${rows.length} projects, ${sum.toFixed(1)} h total in range.`);
 }
 
-main();
+main().catch((e) => fail((e as Error).message));
