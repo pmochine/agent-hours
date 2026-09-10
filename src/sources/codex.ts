@@ -1,21 +1,37 @@
 /**
  * Codex CLI source adapter.
  *
- * Codex stores sessions in ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl.
- * Every line has a top-level ISO `timestamp`; the first line is a
- * `session_meta` record carrying `payload.cwd` (project matching) and
- * `payload.source` ("exec" = non-interactive run launched by a script or
- * another agent — its "user" messages are machine-authored, so the whole
- * session counts as AI runtime; "tui"/IDE sessions have real human prompts).
- *
- * Verified against real logs 2026-06-12 (Codex CLI 0.135/0.139).
+ * Codex stores active sessions below <codex-home>/sessions and completed or
+ * manually archived sessions below <codex-home>/archived_sessions. The first
+ * session_meta record carries the project cwd and the session source.
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
 import type { NamedSession, SessionEvent } from "../core.js";
 
-export const CODEX_SESSIONS_BASE = path.join(os.homedir(), ".codex", "sessions");
+export const CODEX_HOME = process.env["CODEX_HOME"] || path.join(os.homedir(), ".codex");
+export const CODEX_SESSIONS_BASE = path.join(CODEX_HOME, "sessions");
+export const CODEX_ARCHIVED_SESSIONS_BASE = path.join(CODEX_HOME, "archived_sessions");
+
+export type CodexSessionBase = string | string[];
+
+export interface CodexSessionFile {
+  file: string;
+  cwd: string;
+  sessionId: string | null;
+  interactive: boolean;
+  subagent: boolean;
+  startedAt: number;
+}
+
+export interface ScannedCodexSession extends CodexSessionFile {
+  session: NamedSession;
+}
+
+export function defaultCodexSessionDirs(): string[] {
+  return [CODEX_SESSIONS_BASE, CODEX_ARCHIVED_SESSIONS_BASE];
+}
 
 function walkJsonl(dir: string, out: string[] = []): string[] {
   let entries: fs.Dirent[];
@@ -32,17 +48,24 @@ function walkJsonl(dir: string, out: string[] = []): string[] {
   return out;
 }
 
-interface CodexMeta {
-  cwd: string | null;
-  interactive: boolean;
+/** Resolve symlinks where possible and make macOS NFC/NFD paths comparable. */
+export function canonicalProjectPath(p: string): string {
+  const resolved = path.resolve(p);
+  try {
+    return fs.realpathSync.native(resolved).normalize("NFC");
+  } catch {
+    return resolved.normalize("NFC");
+  }
 }
 
-/**
- * Cheap header check: only the first line is needed to match the project.
- * The session_meta line can be huge (it embeds the agent's base instructions),
- * so read in growing chunks until the first newline appears.
- */
-function readMeta(file: string): CodexMeta | null {
+function isSubagentSource(payload: Record<string, unknown>): boolean {
+  const source = payload["source"];
+  if (source && typeof source === "object" && "subagent" in source) return true;
+  return payload["thread_source"] === "subagent" || typeof payload["parent_thread_id"] === "string";
+}
+
+/** Read the first session_meta only; later metadata may be inherited context. */
+function readMeta(file: string): CodexSessionFile | null {
   let fd: number;
   try {
     fd = fs.openSync(file, "r");
@@ -67,9 +90,21 @@ function readMeta(file: string): CodexMeta | null {
     const rec = JSON.parse(firstLine) as Record<string, unknown>;
     if (rec["type"] !== "session_meta") return null;
     const payload = (rec["payload"] ?? {}) as Record<string, unknown>;
+    if (typeof payload["cwd"] !== "string") return null;
+    const subagent = isSubagentSource(payload);
+    const source = payload["source"];
+    const ts = typeof rec["timestamp"] === "string" ? Date.parse(rec["timestamp"] as string) : NaN;
+    const rawId = payload["id"] ?? payload["session_id"];
     return {
-      cwd: typeof payload["cwd"] === "string" ? (payload["cwd"] as string) : null,
-      interactive: payload["source"] !== "exec",
+      file,
+      cwd: payload["cwd"] as string,
+      sessionId: typeof rawId === "string" ? rawId : null,
+      interactive:
+        !subagent &&
+        (source === undefined ||
+          (typeof source === "string" && source !== "exec" && source !== "mcp")),
+      subagent,
+      startedAt: Number.isNaN(ts) ? 0 : ts,
     };
   } catch {
     return null;
@@ -78,19 +113,38 @@ function readMeta(file: string): CodexMeta | null {
   }
 }
 
-function parseEvents(
-  file: string,
-  sinceMs: number,
-  untilMs: number,
-  interactive: boolean
-): SessionEvent[] {
+function userText(payload: Record<string, unknown>): string | null {
+  const content = payload["content"];
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return null;
+  const texts = content
+    .filter((c): c is Record<string, unknown> => !!c && typeof c === "object")
+    .filter((c) => c["type"] === "input_text" || c["type"] === "text")
+    .map((c) => c["text"])
+    .filter((t): t is string => typeof t === "string")
+    .filter((t) => !isSyntheticCodexUserText(t));
+  return texts.length ? texts.join("\n") : null;
+}
+
+/** Known Codex-injected user-role context, not text typed by the person. */
+export function isSyntheticCodexUserText(text: string): boolean {
+  // Current Codex rollouts often put one or more XML-like context envelopes
+  // before the real human input in the same multipart message.
+  const trimmed = text.trimStart();
+  return trimmed.startsWith("<") || trimmed.startsWith("# AGENTS.md instructions for ");
+}
+
+function parseEvents(meta: CodexSessionFile, sinceMs: number, untilMs: number): SessionEvent[] {
   let raw: string;
   try {
-    raw = fs.readFileSync(file, "utf8");
+    raw = fs.readFileSync(meta.file, "utf8");
   } catch {
     return [];
   }
   const events: SessionEvent[] = [];
+  // Current subagent rollouts can contain a replay of parent history. Its
+  // original timestamps predate the child session_meta and must not count twice.
+  const effectiveSince = meta.subagent ? Math.max(sinceMs, meta.startedAt) : sinceMs;
   for (const line of raw.split("\n")) {
     if (!line.trim()) continue;
     let r: Record<string, unknown>;
@@ -102,53 +156,111 @@ function parseEvents(
     const tsStr = r["timestamp"];
     if (typeof tsStr !== "string") continue;
     const ts = Date.parse(tsStr);
-    if (Number.isNaN(ts) || ts < sinceMs || ts > untilMs) continue;
+    if (Number.isNaN(ts) || ts < effectiveSince || ts > untilMs) continue;
 
     let kind: SessionEvent["kind"] = "work";
     let presence = false;
-    if (interactive && r["type"] === "response_item") {
-      const p = (r["payload"] ?? {}) as Record<string, unknown>;
+    const p = (r["payload"] ?? {}) as Record<string, unknown>;
+    if (meta.interactive && r["type"] === "response_item") {
       if (p["type"] === "message" && p["role"] === "user") {
-        const content = p["content"];
-        const text = Array.isArray(content)
-          ? (content.find(
-              (c) => c && typeof c === "object" && (c as Record<string, unknown>)["type"] === "input_text"
-            ) as Record<string, unknown> | undefined)?.["text"]
-          : undefined;
-        // Codex injects environment/permission context as user-role messages
-        // wrapped in <tags> — those are not human.
-        if (typeof text === "string" && !text.trimStart().startsWith("<")) {
+        const text = userText(p);
+        if (text && !isSyntheticCodexUserText(text)) {
           kind = "prompt";
           presence = true;
         }
       }
     }
-    events.push({ ts, kind, presence });
+    const item = (p["item"] ?? {}) as Record<string, unknown>;
+    const reactionAnchor =
+      (r["type"] === "response_item" && p["type"] === "message" && p["role"] === "assistant") ||
+      (r["type"] === "event_msg" &&
+        p["type"] === "item_completed" &&
+        item["type"] === "AgentMessage");
+    events.push({ ts, kind, presence, reactionAnchor });
   }
   events.sort((a, b) => a.ts - b.ts);
   return events;
 }
 
-/**
- * Loads all Codex sessions whose cwd is the project path (or inside it).
- * Session names are prefixed "codex:" for --by-session readability.
- */
+function baseDirs(baseDir?: CodexSessionBase): string[] {
+  if (Array.isArray(baseDir)) return baseDir;
+  return baseDir ? [baseDir] : defaultCodexSessionDirs();
+}
+
+function scanCodexMetadata(
+  baseDir?: CodexSessionBase,
+  projectPath?: string,
+  includeDescendants = true
+): CodexSessionFile[] {
+  const seenIds = new Set<string>();
+  const files: CodexSessionFile[] = [];
+  for (const dir of baseDirs(baseDir)) {
+    for (const file of walkJsonl(dir).sort()) {
+      const meta = readMeta(file);
+      if (!meta) continue;
+      const dedupeKey = meta.sessionId ?? canonicalProjectPath(file);
+      if (seenIds.has(dedupeKey)) continue;
+      seenIds.add(dedupeKey);
+      if (projectPath && !belongsToProject(meta.cwd, projectPath, includeDescendants)) continue;
+      files.push(meta);
+    }
+  }
+  return files;
+}
+
+/** Load every unique Codex rollout once, preferring active over archived copies. */
+export function scanCodexSessions(
+  sinceMs: number,
+  untilMs: number,
+  baseDir?: CodexSessionBase,
+  projectPath?: string,
+  includeDescendants = true
+): ScannedCodexSession[] {
+  const scanned: ScannedCodexSession[] = [];
+  for (const meta of scanCodexMetadata(baseDir, projectPath, includeDescendants)) {
+      const events = parseEvents(meta, sinceMs, untilMs);
+      if (!events.length) continue;
+      const containingDir = baseDirs(baseDir).find((dir) => meta.file.startsWith(dir + path.sep));
+      scanned.push({
+        ...meta,
+        session: {
+          name: `codex:${path.relative(containingDir ?? path.dirname(meta.file), meta.file)}`,
+          events,
+        },
+      });
+  }
+  return scanned;
+}
+
+function belongsToProject(cwd: string, projectPath: string, includeDescendants: boolean): boolean {
+  const actual = canonicalProjectPath(cwd);
+  const project = canonicalProjectPath(projectPath);
+  return actual === project || (includeDescendants && actual.startsWith(project + path.sep));
+}
+
+/** Loads Codex sessions whose cwd is the project path (or inside it). */
 export function loadCodexSessions(
   projectPath: string,
   sinceMs: number,
   untilMs: number,
-  baseDir: string = CODEX_SESSIONS_BASE
+  baseDir?: CodexSessionBase,
+  includeDescendants = true
 ): NamedSession[] {
-  const project = path.resolve(projectPath);
-  const sessions: NamedSession[] = [];
-  for (const file of walkJsonl(baseDir).sort()) {
-    const meta = readMeta(file);
-    if (!meta || !meta.cwd) continue;
-    if (meta.cwd !== project && !meta.cwd.startsWith(project + path.sep)) continue;
-    const events = parseEvents(file, sinceMs, untilMs, meta.interactive);
-    if (events.length > 0) {
-      sessions.push({ name: `codex:${path.relative(baseDir, file)}`, events });
-    }
-  }
-  return sessions;
+  return scanCodexSessions(sinceMs, untilMs, baseDir, projectPath, includeDescendants).map(
+    (s) => s.session
+  );
+}
+
+/** Same matching as loadCodexSessions, without parsing every unrelated rollout. */
+export function findCodexSessionFiles(
+  projectPath: string,
+  sinceMs: number,
+  untilMs: number,
+  baseDir?: CodexSessionBase,
+  includeDescendants = true
+): CodexSessionFile[] {
+  // The caller still filters individual records to the requested time range.
+  void sinceMs;
+  void untilMs;
+  return scanCodexMetadata(baseDir, projectPath, includeDescendants);
 }

@@ -1,11 +1,11 @@
 #!/usr/bin/env node
 /**
  * agent-hours — billable hours from local coding-agent session logs
- * (Claude Code today; Codex adapter planned), including the three-state
- * split: hands-on / supervised / AI-autonomous.
+ * (Claude Code + Codex), including the three-state
+ * split: direct interaction / supervised / AI-autonomous.
  *
- * Data source: ~/.claude/projects/<project-hash>/*.jsonl (local only,
- * retroactive, zero setup — nothing leaves your machine).
+ * Data source: local Claude and Codex JSONL transcripts (retroactive, zero
+ * setup — nothing leaves your machine unless --summarize is requested).
  */
 import { parseArgs } from "node:util";
 import { spawnSync } from "node:child_process";
@@ -18,26 +18,39 @@ import {
   bucketMinutesByDay,
   computeRefinedSplit,
   countByDay,
+  dateTimeKey,
   dayKey,
   detectOverlaps,
   findPauses,
+  findClaudeProjectDirs,
   findProjectDir,
   loadProject,
   mergeEvents,
   parseDate,
+  readClaudeProjectCwd,
   type NamedSession,
   type RefinedSplit,
   type SessionEvent,
+  type TimeZoneSpec,
 } from "./core.js";
 import {
   WORKLOG_LLM_TEMPLATE,
+  collectCodexWorklog,
   collectWorklog,
   describeLog,
   mergeLogs,
+  mergeWorklogMaps,
   shortPath,
+  type HourLog,
 } from "./worklog.js";
 import * as readline from "node:readline/promises";
-import { CODEX_SESSIONS_BASE, loadCodexSessions } from "./sources/codex.js";
+import {
+  CODEX_ARCHIVED_SESSIONS_BASE,
+  CODEX_SESSIONS_BASE,
+  canonicalProjectPath,
+  loadCodexSessions,
+  scanCodexSessions,
+} from "./sources/codex.js";
 import {
   RECOMMENDED_RETENTION_DAYS,
   checkRetention,
@@ -53,7 +66,7 @@ Usage:
                                      "what did I work on this week?", and
                                      offers to raise Claude's log retention
   npx agent-hours                    current project, cap overview
-  npx agent-hours --split            hands-on / supervised / AI-autonomous
+  npx agent-hours --split            direct interaction / supervised / AI-autonomous
   npx agent-hours --by-day --split   per-day table with split
   npx agent-hours --worklog          hourly worklog (invoice attachment)
   npx agent-hours --worklog --csv    hourly CSV incl. what-was-done column
@@ -68,10 +81,10 @@ Options:
                          agents into ONE timeline, no double counting)
   --summarize            refine worklog descriptions via \`claude -p\`
                          (opt-in, the ONLY feature that costs API money)
-  --since <date>         start, inclusive (YYYY-MM-DD [HH:MM], UTC)
-  --until <date>         end, inclusive (YYYY-MM-DD [HH:MM], UTC)
+  --since <date>         start, inclusive (YYYY-MM-DD [HH:MM], local zone)
+  --until <date>         end, inclusive (YYYY-MM-DD [HH:MM], local zone)
   --cap <min>            idle cap for total time (default: 10)
-  --prompt-cap <min>     idle cap for hands-on reaction tails (default: 10)
+  --prompt-cap <min>     cap for direct-interaction windows (default: 10)
   --split                show the three-state human/AI split
   --by-day               per-day breakdown
   --by-session           per-session breakdown (parallel-session debugging)
@@ -79,22 +92,23 @@ Options:
   --worklog-json         hourly worklog as JSON + LLM prompt template
   --csv                  CSV output (semicolon-separated)
   --json                 JSON output (always includes the split)
-  --tz-offset <h>        UTC offset for day bucketing (default: 2)
+  --timezone <iana>      IANA zone for ranges/buckets (default: system zone)
+  --tz-offset <h>        fixed-offset compatibility mode; disables DST
   --pauses               list longest pauses (> cap)
   --top-pauses <n>       how many pauses to list (default: 10)
-  --all-projects         scan every project under ~/.claude/projects
+  --all-projects         scan projects found in Claude and/or Codex logs
   --set-retention        (with install) set cleanupPeriodDays=365 without asking
   --no-retention         (with install) skip the log-retention check
   -h, --help             this help
   -v, --version          version
 
-Methodology — three states, honest band instead of fake precision:
-  hands-on     gaps ending in a prompt: you read/thought/typed (lower bound)
+Methodology — three states, an estimate rather than a stopwatch:
+  direct       credited reaction tails ending in a prompt (estimate)
   supervised   agent working while evidence says you watched (reaction < 30s
                => 100%, < 5min => 50%; mid-turn typing / external file edits
                force 100%)
   AI-autonomous the rest of agent runtime
-Browser/call time is NOT in the logs — rule of thumb: add 15-25 %.`;
+Browser, call, and unrelated editor time is not present in agent logs.`;
 
 function fail(msg: string): never {
   process.stderr.write(msg + "\n");
@@ -108,6 +122,21 @@ function fmtH(minutes: number): string {
 function hhmm(minutes: number): string {
   const m = Math.floor(minutes);
   return `${Math.floor(m / 60)}:${String(m % 60).padStart(2, "0")}`;
+}
+
+/** A bare non-path value can still be a legacy Claude project hash. */
+function resolveProjectPath(projectArg?: string): string | null {
+  if (projectArg === undefined) return canonicalProjectPath(process.cwd());
+  const candidate = path.resolve(projectArg);
+  if (
+    path.isAbsolute(projectArg) ||
+    projectArg.startsWith(".") ||
+    projectArg.includes(path.sep) ||
+    fs.existsSync(candidate)
+  ) {
+    return canonicalProjectPath(candidate);
+  }
+  return null;
 }
 
 /**
@@ -180,7 +209,8 @@ async function main(): Promise<void> {
         "worklog-json": { type: "boolean", default: false },
         csv: { type: "boolean", default: false },
         json: { type: "boolean", default: false },
-        "tz-offset": { type: "string", default: "2" },
+        timezone: { type: "string" },
+        "tz-offset": { type: "string" },
         pauses: { type: "boolean", default: false },
         "top-pauses": { type: "string", default: "10" },
         "all-projects": { type: "boolean", default: false },
@@ -213,8 +243,9 @@ async function main(): Promise<void> {
     console.log(`  "How many hours did I work on this project last week?"`);
     console.log(`  "What did I work on yesterday? Export a CSV for my invoice."`);
     console.log();
-    console.log("Tip (fewer permission prompts): allow \"Bash(npx agent-hours *)\"");
-    console.log("in ~/.claude/settings.json under permissions.allow.");
+    console.log("Tip (fewer permission prompts): allow \"Bash(agent-hours *)\"");
+    console.log("and/or \"Bash(npx agent-hours *)\" in ~/.claude/settings.json");
+    console.log("under permissions.allow.");
     return;
   } else if (positionals.length > 0) {
     fail(`Unknown command '${positionals[0]}'. Run agent-hours --help for usage.`);
@@ -234,29 +265,34 @@ async function main(): Promise<void> {
 
   const cap = Number(args.cap);
   const promptCap = Number(args["prompt-cap"]);
-  const tzOffset = Number(args["tz-offset"]);
   const topPauses = Number(args["top-pauses"]);
   if (!Number.isFinite(cap) || cap <= 0) fail("--cap must be a positive number of minutes.");
   if (!Number.isFinite(promptCap) || promptCap <= 0) fail("--prompt-cap must be a positive number of minutes.");
-  if (!Number.isFinite(tzOffset)) fail("--tz-offset must be a number of hours.");
+  if (args.timezone && args["tz-offset"] !== undefined) fail("Use either --timezone or --tz-offset, not both.");
+  let timeZone: TimeZoneSpec = args.timezone ?? Intl.DateTimeFormat().resolvedOptions().timeZone ?? "UTC";
+  if (args["tz-offset"] !== undefined) {
+    const offset = Number(args["tz-offset"]);
+    if (!Number.isFinite(offset)) fail("--tz-offset must be a number of hours.");
+    timeZone = offset;
+  }
+  try {
+    dayKey(Date.now(), timeZone);
+  } catch {
+    fail(`Invalid time zone: ${String(timeZone)}`);
+  }
 
   let sinceMs = 0;
   let untilMs = Date.parse("2100-01-01T00:00:00Z");
   try {
-    if (args.since) sinceMs = parseDate(args.since);
+    if (args.since) sinceMs = parseDate(args.since, timeZone);
     if (args.until) {
       untilMs =
         args.until.includes(" ") || args.until.includes("T")
-          ? parseDate(args.until)
-          : parseDate(args.until + "T23:59:59Z");
+          ? parseDate(args.until, timeZone)
+          : parseDate(args.until + " 23:59:59", timeZone) + 999;
     }
   } catch (e) {
     fail((e as Error).message);
-  }
-
-  if (args["all-projects"]) {
-    runAllProjects(sinceMs, untilMs, cap, promptCap, tzOffset, args.split, args.json);
-    return;
   }
 
   const source = String(args.source).toLowerCase();
@@ -266,30 +302,53 @@ async function main(): Promise<void> {
   const wantClaude = source === "auto" || source === "claude";
   const wantCodex = source === "auto" || source === "codex";
 
+  if (args["all-projects"]) {
+    runAllProjects(sinceMs, untilMs, cap, promptCap, timeZone, source, args.split, args.json);
+    return;
+  }
+
   const projectDir = findProjectDir(args.project);
   // Codex matching needs a real path; a bare Claude hash can't be mapped back.
-  const projectPath =
-    args.project === undefined
-      ? process.cwd()
-      : args.project.includes(path.sep) || args.project.startsWith("/")
-        ? path.resolve(args.project)
-        : null;
+  const projectPath = resolveProjectPath(args.project);
+  const claudeProjectDirs = wantClaude
+    ? projectPath
+      ? findClaudeProjectDirs(projectPath)
+      : fs.existsSync(projectDir)
+        ? [projectDir]
+        : []
+    : [];
 
   const sessions: NamedSession[] = [];
   let claudeCount = 0;
-  if (wantClaude && fs.existsSync(projectDir)) {
-    sessions.push(...loadProject(projectDir, sinceMs, untilMs));
+  if (wantClaude) {
+    for (const dir of claudeProjectDirs) {
+      const loaded = loadProject(dir, sinceMs, untilMs);
+      sessions.push(
+        ...(claudeProjectDirs.length > 1
+          ? loaded.map((session) => ({
+              ...session,
+              name: `${path.basename(dir)}/${session.name}`,
+            }))
+          : loaded)
+      );
+    }
     claudeCount = sessions.length;
   }
-  if (wantCodex && projectPath && fs.existsSync(CODEX_SESSIONS_BASE)) {
+  if (
+    wantCodex &&
+    projectPath &&
+    (fs.existsSync(CODEX_SESSIONS_BASE) || fs.existsSync(CODEX_ARCHIVED_SESSIONS_BASE))
+  ) {
     sessions.push(...loadCodexSessions(projectPath, sinceMs, untilMs));
   }
   const codexCount = sessions.length - claudeCount;
   if (sessions.length === 0) {
     fail(
       `ERROR: no sessions found.\n` +
-        `  Claude logs checked: ${projectDir}\n` +
-        (wantCodex ? `  Codex logs checked:  ${CODEX_SESSIONS_BASE} (cwd match)\n` : "") +
+        (wantClaude ? `  Claude logs checked: ${projectDir}\n` : "") +
+        (wantCodex
+          ? `  Codex logs checked:  ${CODEX_SESSIONS_BASE} + ${CODEX_ARCHIVED_SESSIONS_BASE} (cwd match)\n`
+          : "") +
         `Tip: pass --project <path> or run from the project root.`
     );
   }
@@ -299,20 +358,28 @@ async function main(): Promise<void> {
   const refined = computeRefinedSplit(merged, {
     capMinutes: cap,
     promptCapMinutes: promptCap,
-    tzOffsetHours: tzOffset,
+    timeZone,
   });
   const allTimes = merged.map((e) => e.ts);
 
   if (args["worklog"] || args["worklog-json"]) {
+    const logs: Map<string, HourLog>[] = [];
+    if (wantClaude) {
+      for (const dir of claudeProjectDirs) {
+        logs.push(collectWorklog(dir, sinceMs, untilMs, timeZone));
+      }
+    }
+    if (wantCodex && projectPath) logs.push(collectCodexWorklog(projectPath, sinceMs, untilMs, timeZone));
+    const worklog = mergeWorklogMaps(logs);
     if (args.csv && !args["worklog-json"]) {
-      printWorklogCsv(projectDir, sinceMs, untilMs, tzOffset, refined, args["by-day"], args.summarize);
+      printWorklogCsv(worklog, refined, args["by-day"], args.summarize);
     } else {
-      printWorklog(projectDir, sinceMs, untilMs, tzOffset, refined, args["worklog-json"], args.summarize);
+      printWorklog(projectDir, worklog, refined, args["worklog-json"], args.summarize);
     }
     return;
   }
   if (args.json) {
-    printJson(projectDir, args, sessions, merged, refined, cap, promptCap, tzOffset, overlapping);
+    printJson(projectDir, args, sessions, merged, refined, cap, promptCap, timeZone, overlapping);
     return;
   }
   if (args.csv) {
@@ -327,6 +394,9 @@ async function main(): Promise<void> {
     `Sessions in range: ${sessions.length}` +
       (codexCount > 0 ? ` (claude ${claudeCount}, codex ${codexCount})` : "")
   );
+  if (claudeProjectDirs.length > 1) {
+    console.log(`Claude project directories matched (root + descendants): ${claudeProjectDirs.length}`);
+  }
   console.log(`Total events: ${merged.length.toLocaleString("en-US")}`);
   console.log();
   console.log("Activity at different idle caps:");
@@ -339,21 +409,22 @@ async function main(): Promise<void> {
     console.log(`  ${String(c).padStart(2)}min    ${h.padStart(6)}h          ${hs.padStart(6)}h${marker}`);
   }
   console.log();
-  console.log("  with cap bonus: industry standard (pause > cap counts cap minutes).");
-  console.log("  strict        : pause > cap counts 0 — honest lower bound for");
+  console.log("  with cap bonus: common activity-log estimate (pause > cap counts cap minutes).");
+  console.log("  strict        : pause > cap counts 0 — conservative activity estimate for");
   console.log("                  background-heavy sessions (orchestrator waits).");
   console.log();
 
   if (args.split) {
     console.log(`Human/AI split — three-state model (cap ${cap}min / prompt cap ${promptCap}min):`);
-    console.log(`  Hands-on (provably human):     ${fmtH(refined.handsOnMinutes).padStart(7)} h   (${refined.promptCount} prompts)`);
+    console.log(`  Direct interaction (estimate): ${fmtH(refined.handsOnMinutes).padStart(7)} h   (${refined.promptCount} prompts)`);
     console.log(`  Supervised (weighted est.):    ${fmtH(refined.supervisedMinutes).padStart(7)} h`);
     console.log(`  = Human attention (model):     ${fmtH(refined.attentionMinutes).padStart(7)} h`);
     console.log(`  Upper bound (inter-prompt):    ${fmtH(refined.upperBoundMinutes).padStart(7)} h`);
     console.log(`  AI autonomous (model):         ${fmtH(refined.aiAutonomousMinutes).padStart(7)} h`);
     console.log(`  Total (merged timeline):       ${fmtH(refined.totalMinutes).padStart(7)} h`);
     console.log();
-    console.log("  Band: hands-on is the defensible lower bound, inter-prompt the upper.");
+    console.log("  Band: direct interaction and attention are estimates from log evidence;");
+    console.log("  the inter-prompt value is a conservative upper estimate.");
     console.log("  The model weighs agent-working windows by watch evidence (reaction");
     console.log("  < 30s / mid-turn typing / external edits). Billing decision is yours.");
     console.log();
@@ -362,7 +433,7 @@ async function main(): Promise<void> {
       const s = computeRefinedSplit(merged, {
         capMinutes: c,
         promptCapMinutes: c,
-        tzOffsetHours: tzOffset,
+        timeZone,
       });
       console.log(
         `    cap ${String(c).padStart(2)}min: total ${fmtH(s.totalMinutes).padStart(6)}h | attention ${fmtH(s.attentionMinutes).padStart(6)}h | AI ${fmtH(s.aiAutonomousMinutes).padStart(6)}h`
@@ -379,17 +450,16 @@ async function main(): Promise<void> {
     console.log(`Pauses > ${cap}min cap (${realPauses.length} total, ${fmtH(idleTotal)}h idle):`);
     console.log(`  Cap-bonus effect: ${capBonus.toFixed(0)}min (${fmtH(capBonus)}h) still counted as work by the standard method.`);
     console.log();
-    console.log(`  Top ${n} longest pauses (shown at tz offset ${tzOffset >= 0 ? "+" : ""}${tzOffset}h):`);
+    console.log(`  Top ${n} longest pauses (shown in ${String(timeZone)}):`);
     for (let i = 0; i < n; i++) {
       const p = realPauses[i];
-      const s = new Date(p.startMs + tzOffset * 3600_000).toISOString().slice(11, 19);
-      const e = new Date(p.endMs + tzOffset * 3600_000).toISOString().slice(11, 19);
+      const s = dateTimeKey(p.startMs, timeZone);
+      const e = dateTimeKey(p.endMs, timeZone);
       const dur =
         p.minutes >= 60
           ? `${Math.floor(p.minutes / 60)}h${String(Math.floor(p.minutes % 60)).padStart(2, "0")}m`
           : `${p.minutes.toFixed(1)} min`;
-      const day = dayKey(p.startMs, tzOffset);
-      console.log(`    ${String(i + 1).padStart(2)}. ${day} ${s} – ${e}  →  ${dur}`);
+      console.log(`    ${String(i + 1).padStart(2)}. ${s} – ${e}  →  ${dur}`);
     }
     console.log();
   }
@@ -406,8 +476,8 @@ async function main(): Promise<void> {
     for (const s of sessions) {
       const times = s.events.map((e) => e.ts);
       const a = fmtH(activeMinutes(times, cap));
-      const f = new Date(times[0] + tzOffset * 3600_000).toISOString().slice(0, 16).replace("T", " ");
-      const l = new Date(times[times.length - 1] + tzOffset * 3600_000).toISOString().slice(0, 16).replace("T", " ");
+      const f = dateTimeKey(times[0], timeZone);
+      const l = dateTimeKey(times[times.length - 1], timeZone);
       console.log(`  ${s.name}`);
       console.log(`    ${f} – ${l} | ${String(times.length).padStart(4)} events | ${a.padStart(6)}h active`);
     }
@@ -422,7 +492,7 @@ async function main(): Promise<void> {
     if (args.split) {
       const days = aggregateDays(refined);
       console.log(`Per day (cap ${cap}min / prompt cap ${promptCap}min):`);
-      console.log(`  Date        |  Total | Hands-on | Superv. | AI-auto`);
+      console.log(`  Date        |  Total |  Direct | Superv. | AI-auto`);
       for (const day of [...days.keys()].sort()) {
         const d = days.get(day)!;
         console.log(
@@ -430,8 +500,8 @@ async function main(): Promise<void> {
         );
       }
     } else {
-      const dayTotal = bucketMinutesByDay(allTimes, cap, tzOffset);
-      const dayMsgs = countByDay(allTimes, tzOffset);
+      const dayTotal = bucketMinutesByDay(allTimes, cap, timeZone);
+      const dayMsgs = countByDay(allTimes, timeZone);
       console.log(`Per day (cap ${cap}min):`);
       for (const day of [...dayTotal.keys()].sort()) {
         console.log(
@@ -468,7 +538,7 @@ function aggregateDays(refined: RefinedSplit): Map<string, DayStates> {
 function printCsv(refined: RefinedSplit, withSplit: boolean): void {
   const days = aggregateDays(refined);
   const header = ["Datum", "Dauer (h)", "Dauer (Stunden:Minuten)"];
-  if (withSplit) header.push("Hands-on (h)", "Supervised (h)", "Mensch gesamt (h)", "AI-solo (h)");
+  if (withSplit) header.push("Direct interaction (h)", "Supervised (h)", "Mensch gesamt (h)", "AI-solo (h)");
   console.log(header.join(";"));
   for (const day of [...days.keys()].sort()) {
     const d = days.get(day)!;
@@ -527,15 +597,11 @@ function aiSummarize(buckets: SummaryBucket[]): Map<string, string> {
  * --by-day. Always ends with a GESAMT row describing the whole range.
  */
 function printWorklogCsv(
-  projectDir: string,
-  sinceMs: number,
-  untilMs: number,
-  tzOffset: number,
+  log: Map<string, HourLog>,
   refined: RefinedSplit,
   byDay: boolean,
   summarize = false
 ): void {
-  const log = collectWorklog(projectDir, sinceMs, untilMs, tzOffset);
   const keys = [...new Set([...refined.byHour.keys(), ...log.keys()])].sort();
 
   // Optional AI pass: collect evidence per row key, one claude -p call.
@@ -562,7 +628,7 @@ function printWorklogCsv(
     ai.get(key) ?? describeLog(l, maxLen);
 
   if (byDay) {
-    console.log(["Datum", "Aktiv (h)", "Hands-on (h)", "Supervised (h)", "AI (h)", "Beschreibung"].join(";"));
+    console.log(["Datum", "Aktiv (h)", "Direct interaction (h)", "Supervised (h)", "AI (h)", "Beschreibung"].join(";"));
     const days = [...new Set(keys.map((k) => k.slice(0, 10)))].sort();
     for (const day of days) {
       const dayHours = keys.filter((k) => k.startsWith(day));
@@ -585,7 +651,7 @@ function printWorklogCsv(
       );
     }
   } else {
-    console.log(["Datum", "Stunde", "Aktiv (min)", "Hands-on (min)", "Supervised (min)", "AI (min)", "Beschreibung"].join(";"));
+    console.log(["Datum", "Stunde", "Aktiv (min)", "Direct interaction (min)", "Supervised (min)", "AI (min)", "Beschreibung"].join(";"));
     for (const k of keys) {
       const st = refined.byHour.get(k) ?? { total: 0, handsOn: 0, supervised: 0, ai: 0 };
       const l = log.get(k);
@@ -620,14 +686,11 @@ function printWorklogCsv(
 
 function printWorklog(
   projectDir: string,
-  sinceMs: number,
-  untilMs: number,
-  tzOffset: number,
+  log: Map<string, HourLog>,
   refined: RefinedSplit,
   asJson: boolean,
   summarize = false
 ): void {
-  const log = collectWorklog(projectDir, sinceMs, untilMs, tzOffset);
   const hours = [...new Set([...refined.byHour.keys(), ...log.keys()])].sort();
 
   let ai = new Map<string, string>();
@@ -684,7 +747,7 @@ function printWorklog(
     const st = refined.byHour.get(h);
     const l = log.get(h);
     const mins = st
-      ? `${st.total.toFixed(0)} min active (${st.handsOn.toFixed(0)} hands-on / ${st.supervised.toFixed(0)} supervised / ${st.ai.toFixed(0)} AI)`
+      ? `${st.total.toFixed(0)} min active (${st.handsOn.toFixed(0)} direct / ${st.supervised.toFixed(0)} supervised / ${st.ai.toFixed(0)} AI)`
       : "evidence only";
     console.log(`\n### ${h.slice(11)} · ${mins}`);
     const summary = ai.get(h);
@@ -707,7 +770,7 @@ function printWorklog(
   const overall = ai.get("OVERALL");
   if (overall) console.log(`**Overall:** ${overall}\n`);
   console.log(
-    `Totals: ${fmtH(refined.totalMinutes)}h | hands-on ${fmtH(refined.handsOnMinutes)}h | supervised ${fmtH(refined.supervisedMinutes)}h | AI ${fmtH(refined.aiAutonomousMinutes)}h`
+    `Totals: ${fmtH(refined.totalMinutes)}h | direct ${fmtH(refined.handsOnMinutes)}h | supervised ${fmtH(refined.supervisedMinutes)}h | AI ${fmtH(refined.aiAutonomousMinutes)}h`
   );
   if (!summarize) {
     console.log(`Tip: --summarize refines descriptions via claude -p (paid), or pipe --worklog-json into your AI chat for free.`);
@@ -722,7 +785,7 @@ function printJson(
   refined: RefinedSplit,
   cap: number,
   promptCap: number,
-  tzOffset: number,
+  timeZone: TimeZoneSpec,
   overlapping: boolean
 ): void {
   const allTimes = merged.map((e) => e.ts);
@@ -733,7 +796,7 @@ function printJson(
     const s = computeRefinedSplit(merged, {
       capMinutes: c,
       promptCapMinutes: c,
-      tzOffsetHours: tzOffset,
+      timeZone,
     });
     caps[String(c)] = {
       totalHours: +(s.totalMinutes / 60).toFixed(2),
@@ -750,7 +813,8 @@ function printJson(
         until: args.until ?? null,
         capMinutes: cap,
         promptCapMinutes: promptCap,
-        tzOffsetHours: tzOffset,
+        timeZone: typeof timeZone === "string" ? timeZone : null,
+        tzOffsetHours: typeof timeZone === "number" ? timeZone : null,
         sessions: sessions.length,
         events: merged.length,
         prompts: refined.promptCount,
@@ -786,21 +850,11 @@ function runAllProjects(
   untilMs: number,
   cap: number,
   promptCap: number,
-  tzOffset: number,
+  timeZone: TimeZoneSpec,
+  source: string,
   withSplit: boolean,
   asJson: boolean
 ): void {
-  let dirs: string[];
-  try {
-    dirs = fs
-      .readdirSync(PROJECTS_BASE, { withFileTypes: true })
-      .filter((d) => d.isDirectory())
-      .map((d) => d.name)
-      .sort();
-  } catch {
-    fail(`ERROR: cannot read ${PROJECTS_BASE}`);
-  }
-
   interface Row {
     project: string;
     totalHours: number;
@@ -809,29 +863,92 @@ function runAllProjects(
     events: number;
     lastActivity: string;
   }
+  interface ProjectSessions {
+    project: string;
+    sessions: NamedSession[];
+  }
+
+  const projects = new Map<string, ProjectSessions>();
+  const wantClaude = source === "auto" || source === "claude";
+  const wantCodex = source === "auto" || source === "codex";
+
+  if (wantClaude) {
+    let dirs: string[] = [];
+    try {
+      dirs = fs
+        .readdirSync(PROJECTS_BASE, { withFileTypes: true })
+        .filter((d) => d.isDirectory())
+        .map((d) => d.name)
+        .sort();
+    } catch {
+      // A machine with Codex-only history need not have ~/.claude/projects.
+    }
+    for (const dir of dirs) {
+      const sessions = loadProject(path.join(PROJECTS_BASE, dir), sinceMs, untilMs);
+      if (sessions.length) {
+        const cwd = readClaudeProjectCwd(path.join(PROJECTS_BASE, dir));
+        const key = cwd ? `path:${canonicalProjectPath(cwd)}` : `hash:${dir}`;
+        const existing = projects.get(key);
+        if (existing) existing.sessions.push(...sessions);
+        else projects.set(key, { project: cwd ?? dir, sessions });
+      }
+    }
+  }
+
+  if (wantCodex) {
+    for (const scanned of scanCodexSessions(sinceMs, untilMs)) {
+      const cwd = canonicalProjectPath(scanned.cwd);
+      const key = `path:${cwd}`;
+      const existing = projects.get(key) ?? { project: cwd, sessions: [] };
+      // Prefer the readable cwd when a matching Claude path already exists.
+      existing.project = cwd;
+      existing.sessions.push(scanned.session);
+      projects.set(key, existing);
+    }
+  }
+
   const rows: Row[] = [];
-  for (const dir of dirs) {
-    const sessions = loadProject(path.join(PROJECTS_BASE, dir), sinceMs, untilMs);
-    if (sessions.length === 0) continue;
+  const allSessions: NamedSession[] = [];
+  for (const { project, sessions } of projects.values()) {
+    allSessions.push(...sessions);
     const merged = mergeEvents(sessions);
     const refined = computeRefinedSplit(merged, {
       capMinutes: cap,
       promptCapMinutes: promptCap,
-      tzOffsetHours: tzOffset,
+      timeZone,
     });
     rows.push({
-      project: dir,
+      project,
       totalHours: +(refined.totalMinutes / 60).toFixed(2),
       attentionHours: +(refined.attentionMinutes / 60).toFixed(2),
       aiAutonomousHours: +(refined.aiAutonomousMinutes / 60).toFixed(2),
       events: merged.length,
-      lastActivity: dayKey(merged[merged.length - 1].ts, tzOffset),
+      lastActivity: dayKey(merged[merged.length - 1].ts, timeZone),
     });
   }
   rows.sort((a, b) => b.totalHours - a.totalHours);
 
   if (asJson) {
-    console.log(JSON.stringify({ capMinutes: cap, promptCapMinutes: promptCap, projects: rows }, null, 2));
+    const grand = computeRefinedSplit(mergeEvents(allSessions), {
+      capMinutes: cap,
+      promptCapMinutes: promptCap,
+      timeZone,
+    });
+    console.log(
+      JSON.stringify(
+        {
+          capMinutes: cap,
+          promptCapMinutes: promptCap,
+          source,
+          timeZone: typeof timeZone === "string" ? timeZone : null,
+          tzOffsetHours: typeof timeZone === "number" ? timeZone : null,
+          totalHours: +(grand.totalMinutes / 60).toFixed(2),
+          projects: rows,
+        },
+        null,
+        2
+      )
+    );
     return;
   }
 
@@ -841,9 +958,7 @@ function runAllProjects(
     ? `  ${"Hours".padStart(7)} ${"Attn".padStart(7)} ${"AI-auto".padStart(8)}  ${"Last".padEnd(11)} Project`
     : `  ${"Hours".padStart(7)} ${"Events".padStart(7)}  ${"Last".padEnd(11)} Project`;
   console.log(head);
-  let sum = 0;
   for (const r of rows) {
-    sum += r.totalHours;
     if (withSplit) {
       console.log(
         `  ${r.totalHours.toFixed(2).padStart(6)}h ${r.attentionHours.toFixed(2).padStart(6)}h ${r.aiAutonomousHours.toFixed(2).padStart(7)}h  ${r.lastActivity.padEnd(11)} ${r.project}`
@@ -854,8 +969,13 @@ function runAllProjects(
       );
     }
   }
+  const grand = computeRefinedSplit(mergeEvents(allSessions), {
+    capMinutes: cap,
+    promptCapMinutes: promptCap,
+    timeZone,
+  });
   console.log();
-  console.log(`  ${rows.length} projects, ${sum.toFixed(1)} h total in range.`);
+  console.log(`  ${rows.length} projects, ${fmtH(grand.totalMinutes)} h merged wall-clock activity.`);
 }
 
 main().catch((e) => fail((e as Error).message));

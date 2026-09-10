@@ -1,6 +1,6 @@
 /**
- * claude-hours core — ported 1:1 from the battle-tested Python reference
- * (reference/claude_hours.py + reference/prototype-split.py).
+ * agent-hours timing core. The legacy binary calculation remains compatible
+ * with reference/claude_hours.py + reference/prototype-split.py.
  *
  * Parity is enforced by test/parity.test.mjs: same fixtures through both
  * implementations must yield identical numbers.
@@ -22,6 +22,10 @@ export interface SessionEvent {
    * Used by the three-state model to upgrade "supervised" confidence.
    */
   presence: boolean;
+  /** Session identity, attached by mergeEvents for same-session reasoning. */
+  session?: string;
+  /** True for assistant output a later human prompt can genuinely react to. */
+  reactionAnchor?: boolean;
 }
 
 export interface NamedSession {
@@ -54,9 +58,13 @@ export function projectToHash(p: string): string {
 export function findProjectDir(projectArg?: string): string {
   let hashName: string;
   if (projectArg) {
+    const candidate = path.resolve(projectArg);
     hashName =
-      projectArg.includes(path.sep) || projectArg.startsWith("/")
-        ? projectToHash(projectArg)
+      path.isAbsolute(projectArg) ||
+      projectArg.startsWith(".") ||
+      projectArg.includes(path.sep) ||
+      fs.existsSync(candidate)
+        ? projectToHash(candidate)
         : projectArg;
   } else {
     hashName = projectToHash(process.cwd());
@@ -64,9 +72,101 @@ export function findProjectDir(projectArg?: string): string {
   return path.join(PROJECTS_BASE, hashName);
 }
 
+function canonicalPath(p: string): string {
+  const resolved = path.resolve(p);
+  try {
+    return fs.realpathSync.native(resolved).normalize("NFC");
+  } catch {
+    return resolved.normalize("NFC");
+  }
+}
+
+function cwdFromJsonl(file: string): string | null {
+  let raw: string;
+  try {
+    raw = fs.readFileSync(file, "utf8");
+  } catch {
+    return null;
+  }
+  for (const line of raw.split("\n").slice(0, 200)) {
+    if (!line.trim()) continue;
+    try {
+      const cwd = (JSON.parse(line) as Record<string, unknown>)["cwd"];
+      if (typeof cwd === "string") return cwd;
+    } catch {
+      // Keep looking: one malformed record must not hide a usable cwd.
+    }
+  }
+  return null;
+}
+
+/** Best-effort readable cwd for a Claude project directory. */
+export function readClaudeProjectCwd(projectDir: string): string | null {
+  let files: string[];
+  try {
+    files = fs.readdirSync(projectDir).filter((f) => f.endsWith(".jsonl")).sort();
+  } catch {
+    return null;
+  }
+  for (const file of files) {
+    const cwd = cwdFromJsonl(path.join(projectDir, file));
+    if (cwd) return canonicalPath(cwd);
+  }
+  return null;
+}
+
+/**
+ * Find the exact Claude project plus transcripts started in its descendants.
+ * Hash-prefix candidates are confirmed using the cwd stored in the JSONL so
+ * `/tmp/proj-sibling` cannot be mistaken for `/tmp/proj`.
+ */
+export function findClaudeProjectDirs(
+  projectPath: string,
+  projectsBase: string = PROJECTS_BASE,
+  includeDescendants = true
+): string[] {
+  const project = canonicalPath(projectPath);
+  const exactHash = projectToHash(project);
+  let names: string[];
+  try {
+    names = fs
+      .readdirSync(projectsBase, { withFileTypes: true })
+      .filter((e) => e.isDirectory())
+      .map((e) => e.name)
+      .filter((name) => name === exactHash || (includeDescendants && name.startsWith(exactHash + "-")))
+      .sort();
+  } catch {
+    return [];
+  }
+  return names
+    .map((name) => path.join(projectsBase, name))
+    .filter((dir) => {
+      const cwd = readClaudeProjectCwd(dir);
+      if (cwd === null) return path.basename(dir) === exactHash;
+      return cwd === project || (includeDescendants && cwd.startsWith(project + path.sep));
+    });
+}
+
 export interface Classified {
   kind: EventKind;
   presence: boolean;
+}
+
+/**
+ * Claude sometimes stores internal XML-like envelopes as ordinary user-role
+ * records. Without promptSource metadata these must not become human prompts.
+ * A shell escape and an explicit interrupt are genuine user actions.
+ */
+export function isMachineGeneratedText(text: string): boolean {
+  const trimmed = text.trimStart();
+  if (trimmed.startsWith("<bash-input>")) return false;
+  if (trimmed.startsWith("[Request interrupted")) return false;
+  return trimmed.startsWith("<");
+}
+
+/** Explicit Claude sources known to represent a person's input. */
+export function isHumanPromptSource(source: unknown): boolean {
+  return source === "typed" || source === "suggestion_accepted";
 }
 
 /**
@@ -98,7 +198,7 @@ export function classifyRecord(record: unknown): Classified {
     if (
       r["operation"] === "enqueue" &&
       typeof content === "string" &&
-      !content.trimStart().startsWith("<task-notification")
+      !isMachineGeneratedText(content)
     ) {
       return { kind: "prompt", presence: true };
     }
@@ -111,18 +211,27 @@ export function classifyRecord(record: unknown): Classified {
   }
   if (t === "user" && !r["isMeta"] && !r["isCompactSummary"]) {
     const src = r["promptSource"];
-    if (src === "system" || src === "queued") return work;
-    if (src === "typed") return { kind: "prompt", presence: true };
+    if (isHumanPromptSource(src)) return { kind: "prompt", presence: true };
+    // Any explicit non-typed source (system, queued, sdk, hooks, or a future
+    // source) is machine-delivered. The shape fallback is legacy-only.
+    if (src !== undefined) return work;
     const msg = r["message"] as Record<string, unknown> | undefined;
     const c = msg?.["content"];
-    if (typeof c === "string") return { kind: "prompt", presence: true };
+    if (typeof c === "string" && !isMachineGeneratedText(c)) {
+      return { kind: "prompt", presence: true };
+    }
     if (Array.isArray(c)) {
       const items = c.filter(
         (i): i is Record<string, unknown> => i !== null && typeof i === "object"
       );
-      const hasText = items.some((i) => i["type"] === "text");
+      const hasHumanText = items.some(
+        (i) =>
+          i["type"] === "text" &&
+          typeof i["text"] === "string" &&
+          !isMachineGeneratedText(i["text"] as string)
+      );
       const hasToolResult = items.some((i) => i["type"] === "tool_result");
-      if (hasText && !hasToolResult) return { kind: "prompt", presence: true };
+      if (hasHumanText && !hasToolResult) return { kind: "prompt", presence: true };
     }
   }
   return work;
@@ -164,11 +273,13 @@ export function loadSessionEvents(
     const ts = Date.parse(tsStr);
     if (Number.isNaN(ts)) continue;
     if (ts < sinceMs || ts > untilMs) continue;
+    const rawRecord = record as Record<string, unknown>;
+    const reactionAnchor = rawRecord["type"] === "assistant";
     if (forceWork) {
-      events.push({ ts, kind: "work", presence: false });
+      events.push({ ts, kind: "work", presence: false, reactionAnchor });
     } else {
       const c = classifyRecord(record);
-      events.push({ ts, kind: c.kind, presence: c.presence });
+      events.push({ ts, kind: c.kind, presence: c.presence, reactionAnchor });
     }
   }
   events.sort((a, b) => a.ts - b.ts);
@@ -214,9 +325,8 @@ export function loadProject(
 }
 
 /**
- * Industry-standard active time (WakaTime/RescueTime style): sum of
- * inter-event gaps, each gap capped at capMinutes ("cap bonus" — a pause
- * longer than the cap still contributes capMinutes).
+ * Common activity-log estimate: sum inter-event gaps, with each gap capped at
+ * capMinutes ("cap bonus" — a longer pause still contributes capMinutes).
  */
 export function activeMinutes(timesMs: number[], capMinutes: number): number {
   if (timesMs.length < 2) return 0;
@@ -259,7 +369,9 @@ export function findPauses(timesMs: number[], minMinutes: number): Pause[] {
  */
 export function mergeEvents(sessions: NamedSession[]): SessionEvent[] {
   const merged: SessionEvent[] = [];
-  for (const s of sessions) merged.push(...s.events);
+  for (const s of sessions) {
+    for (const event of s.events) merged.push({ ...event, session: event.session ?? s.name });
+  }
   merged.sort((a, b) => a.ts - b.ts);
   return merged;
 }
@@ -305,17 +417,60 @@ export function computeSplit(
   };
 }
 
-/** Local-date key (YYYY-MM-DD) for a UTC timestamp at the given offset. */
-export function dayKey(tsMs: number, tzOffsetHours: number): string {
-  return new Date(tsMs + tzOffsetHours * 3600_000).toISOString().slice(0, 10);
+export type TimeZoneSpec = number | string;
+
+const formatterCache = new Map<string, Intl.DateTimeFormat>();
+
+function zonedParts(tsMs: number, timeZone: string): Record<string, string> {
+  let formatter = formatterCache.get(timeZone);
+  if (!formatter) {
+    formatter = new Intl.DateTimeFormat("en-US", {
+      timeZone,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hourCycle: "h23",
+    });
+    formatterCache.set(timeZone, formatter);
+  }
+  return Object.fromEntries(
+    formatter.formatToParts(new Date(tsMs)).filter((p) => p.type !== "literal").map((p) => [p.type, p.value])
+  );
 }
 
-/** Local-hour key (YYYY-MM-DD HH:00) for a UTC timestamp at the given offset. */
-export function hourKey(tsMs: number, tzOffsetHours: number): string {
-  return (
-    new Date(tsMs + tzOffsetHours * 3600_000).toISOString().slice(0, 13).replace("T", " ") +
-    ":00"
-  );
+function localParts(tsMs: number, zone: TimeZoneSpec): Record<string, string> {
+  if (typeof zone === "number") {
+    const iso = new Date(tsMs + zone * 3600_000).toISOString();
+    return {
+      year: iso.slice(0, 4),
+      month: iso.slice(5, 7),
+      day: iso.slice(8, 10),
+      hour: iso.slice(11, 13),
+      minute: iso.slice(14, 16),
+      second: iso.slice(17, 19),
+    };
+  }
+  return zonedParts(tsMs, zone);
+}
+
+/** Local-date key (YYYY-MM-DD), supporting fixed offsets and IANA zones. */
+export function dayKey(tsMs: number, zone: TimeZoneSpec): string {
+  const p = localParts(tsMs, zone);
+  return `${p.year}-${p.month}-${p.day}`;
+}
+
+/** Local-hour key (YYYY-MM-DD HH:00), supporting daylight-saving changes. */
+export function hourKey(tsMs: number, zone: TimeZoneSpec): string {
+  const p = localParts(tsMs, zone);
+  return `${p.year}-${p.month}-${p.day} ${p.hour}:00`;
+}
+
+export function dateTimeKey(tsMs: number, zone: TimeZoneSpec): string {
+  const p = localParts(tsMs, zone);
+  return `${p.year}-${p.month}-${p.day} ${p.hour}:${p.minute}`;
 }
 
 export interface HourStates {
@@ -327,11 +482,11 @@ export interface HourStates {
 
 export interface RefinedSplit {
   totalMinutes: number;
-  /** Idle gaps + reaction tails right before prompts — provably human. */
+  /** Credited reaction tails right before prompts — an interaction estimate. */
   handsOnMinutes: number;
-  /** Claude-working time weighted by watch probability. */
+  /** Agent-working time weighted by watch probability. */
   supervisedMinutes: number;
-  /** handsOn + supervised — the defensible "human attention" estimate. */
+  /** handsOn + supervised — an evidence-based human-attention estimate. */
   attentionMinutes: number;
   /** Old inter-prompt heuristic — everything between prompts counts. */
   upperBoundMinutes: number;
@@ -344,7 +499,9 @@ export interface RefinedSplit {
 export interface RefinedOptions {
   capMinutes: number;
   promptCapMinutes: number;
-  tzOffsetHours: number;
+  /** Preferred DST-aware zone. tzOffsetHours remains for API compatibility. */
+  timeZone?: TimeZoneSpec;
+  tzOffsetHours?: number;
   /** Reaction faster than this (minutes) ⇒ user watched the whole window. */
   watchFullMinutes?: number;
   /** Reaction up to this (minutes) ⇒ half the window counts as supervised. */
@@ -358,11 +515,14 @@ export interface RefinedOptions {
  * Per prompt-to-prompt window, capped at promptCapMinutes (same cap semantics
  * as the old heuristic, so the old number stays a true upper bound):
  *
- * 1. hands-on  — the reaction tail: time between the last event of any kind
- *    and the next prompt. The human provably read/thought/typed then.
+ * 1. direct interaction — the credited reaction tail between the latest
+ *    assistant output in the same session and the next prompt. If a person
+ *    submits two prompts without assistant output between them, the previous
+ *    prompt is the fallback anchor. This remains an estimate, not proof of
+ *    continuous work throughout the whole tail.
  * 2. supervised — the agent-working part of the capped window, weighted by
  *    watch evidence: reaction < 30 s ⇒ they were watching ⇒ 100 %, < 5 min ⇒
- *    50 %, else 0 %. Hard presence proof inside the window (message typed
+ *    50 %, else 0 %. Hard presence proof in the same session (message typed
  *    mid-turn, external file edit) forces 100 %.
  * 3. AI autonomous — total minus the two above.
  *
@@ -376,6 +536,7 @@ export function computeRefinedSplit(
 ): RefinedSplit {
   const WATCH_FULL = opts.watchFullMinutes ?? 0.5;
   const WATCH_HALF = opts.watchHalfMinutes ?? 5;
+  const timeZone = opts.timeZone ?? opts.tzOffsetHours ?? 0;
   const n = merged.length;
 
   const promptIdx: number[] = [];
@@ -384,7 +545,7 @@ export function computeRefinedSplit(
   // Pass 1: totals per hour over the full event timeline.
   let total = 0;
   const byHour = new Map<string, HourStates>();
-  const hourOf = (tsMs: number) => hourKey(tsMs, opts.tzOffsetHours);
+  const hourOf = (tsMs: number) => hourKey(tsMs, timeZone);
   const bucket = (key: string): HourStates => {
     let b = byHour.get(key);
     if (!b) {
@@ -405,16 +566,51 @@ export function computeRefinedSplit(
   for (let k = 1; k < promptIdx.length; k++) {
     const p1 = promptIdx[k - 1];
     const p2 = promptIdx[k];
-    const windowMin = (merged[p2].ts - merged[p1].ts) / 60000;
-    const cappedWindow = Math.min(windowMin, opts.promptCapMinutes);
-    const reactionMin = (merged[p2].ts - merged[p2 - 1].ts) / 60000;
 
-    const tail = Math.min(reactionMin, cappedWindow);
-    const agentPart = cappedWindow - tail;
+    // A prompt is a reaction to output in its own session. Busy subagents or
+    // another terminal must not manufacture a near-zero reaction time.
+    const promptSession = merged[p2].session;
+    let previousSessionPrompt = -1;
+    for (let j = p2 - 1; j >= 0; j--) {
+      if (merged[j].kind === "prompt" && (!promptSession || merged[j].session === promptSession)) {
+        previousSessionPrompt = j;
+        break;
+      }
+    }
+    let reactionAnchor = -1;
+    for (let j = p2 - 1; j > previousSessionPrompt; j--) {
+      if (
+        merged[j].reactionAnchor === true &&
+        (!promptSession || merged[j].session === promptSession)
+      ) {
+        reactionAnchor = j;
+        break;
+      }
+    }
+    if (reactionAnchor < 0) reactionAnchor = previousSessionPrompt;
+    const reactionMin =
+      reactionAnchor >= 0 ? (merged[p2].ts - merged[reactionAnchor].ts) / 60000 : Infinity;
+
+    // Attention may only be allocated from time that Pass 1 actually credited.
+    // This keeps all states non-negative even when promptCapMinutes > capMinutes.
+    const gaps: Array<{ key: string; credit: number; remaining: number }> = [];
+    let creditedWindow = 0;
+    for (let i = p1 + 1; i <= p2; i++) {
+      const credit = Math.min((merged[i].ts - merged[i - 1].ts) / 60000, opts.capMinutes);
+      creditedWindow += credit;
+      gaps.push({ key: hourOf(merged[i - 1].ts), credit, remaining: credit });
+    }
+    const attentionBudget = Math.min(creditedWindow, opts.promptCapMinutes);
+    const creditedReaction = Number.isFinite(reactionMin) ? reactionMin : 0;
+    const tail = Math.min(creditedReaction, attentionBudget);
+    const agentPart = attentionBudget - tail;
 
     let proof = false;
     for (let j = p2 - 1; j > p1; j--) {
-      if (merged[j].presence) {
+      if (
+        merged[j].presence &&
+        (!promptSession || merged[j].session === promptSession)
+      ) {
         proof = true;
         break;
       }
@@ -427,22 +623,27 @@ export function computeRefinedSplit(
     handsOn += tail;
     supervised += sup;
 
-    // Hour attribution: tail to the hour of the tail gap's start; supervised
-    // distributed over the segment's work gaps proportionally to capped time.
-    bucket(hourOf(merged[p2 - 1].ts)).handsOn += tail;
-    if (sup > 0) {
-      let denom = 0;
-      for (let i = p1 + 1; i < p2; i++) {
-        denom += Math.min((merged[i].ts - merged[i - 1].ts) / 60000, opts.capMinutes);
-      }
-      if (denom > 0) {
-        for (let i = p1 + 1; i < p2; i++) {
-          const g = Math.min((merged[i].ts - merged[i - 1].ts) / 60000, opts.capMinutes);
-          bucket(hourOf(merged[i - 1].ts)).supervised += (sup * g) / denom;
-        }
-      } else {
-        bucket(hourOf(merged[p1].ts)).supervised += sup;
-      }
+    // Allocate attention out of the exact gap credits that make up total.
+    // This guarantees every hourly bucket and the global result obey the same
+    // non-negative state invariant.
+    let tailLeft = tail;
+    for (let i = gaps.length - 1; i >= 0 && tailLeft > 0; i--) {
+      const take = Math.min(gaps[i].remaining, tailLeft);
+      gaps[i].remaining -= take;
+      tailLeft -= take;
+      bucket(gaps[i].key).handsOn += take;
+    }
+    let supLeft = sup;
+    let remainingCapacity = gaps.reduce((sum, gap) => sum + gap.remaining, 0);
+    for (const gap of gaps) {
+      if (supLeft <= 0 || remainingCapacity <= 0) break;
+      const capacity = gap.remaining;
+      const share = (supLeft * capacity) / remainingCapacity;
+      const take = Math.min(capacity, share);
+      gap.remaining -= take;
+      supLeft -= take;
+      remainingCapacity -= capacity;
+      bucket(gap.key).supervised += take;
     }
   }
   for (const b of byHour.values()) {
@@ -451,7 +652,7 @@ export function computeRefinedSplit(
 
   const promptTimes = promptIdx.map((i) => merged[i].ts);
   const upperBound = Math.min(activeMinutes(promptTimes, opts.promptCapMinutes), total);
-  const attention = handsOn + supervised;
+  const attention = Math.min(handsOn + supervised, total);
 
   return {
     totalMinutes: total,
@@ -459,7 +660,7 @@ export function computeRefinedSplit(
     supervisedMinutes: supervised,
     attentionMinutes: attention,
     upperBoundMinutes: upperBound,
-    aiAutonomousMinutes: total - attention,
+    aiAutonomousMinutes: Math.max(0, total - attention),
     promptCount: promptIdx.length,
     byHour,
   };
@@ -472,48 +673,82 @@ export function computeRefinedSplit(
 export function bucketMinutesByDay(
   timesMs: number[],
   capMinutes: number,
-  tzOffsetHours: number
+  timeZone: TimeZoneSpec
 ): Map<string, number> {
   const days = new Map<string, number>();
   for (let i = 1; i < timesMs.length; i++) {
     const gap = Math.min((timesMs[i] - timesMs[i - 1]) / 60000, capMinutes);
-    const day = dayKey(timesMs[i - 1], tzOffsetHours);
+    const day = dayKey(timesMs[i - 1], timeZone);
     days.set(day, (days.get(day) ?? 0) + gap);
   }
   return days;
 }
 
-export function countByDay(timesMs: number[], tzOffsetHours: number): Map<string, number> {
+export function countByDay(timesMs: number[], timeZone: TimeZoneSpec): Map<string, number> {
   const days = new Map<string, number>();
   for (const t of timesMs) {
-    const day = dayKey(t, tzOffsetHours);
+    const day = dayKey(t, timeZone);
     days.set(day, (days.get(day) ?? 0) + 1);
   }
   return days;
 }
 
 /**
- * Parses YYYY-MM-DD, "YYYY-MM-DD HH:MM[:SS]" or an ISO timestamp — all
- * interpreted as UTC (same contract as the Python reference).
+ * Parses YYYY-MM-DD, "YYYY-MM-DD HH:MM[:SS]" or an ISO timestamp. Values
+ * without an explicit offset are interpreted in the requested local zone.
  */
-export function parseDate(s: string): number {
-  if (s.includes("T")) {
+export function parseDate(s: string, zone: TimeZoneSpec = 0): number {
+  if (/T.*(?:Z|[+-]\d\d:\d\d)$/.test(s)) {
+    const calendar = s.match(/^(\d{4})-(\d{2})-(\d{2})T/);
+    if (calendar) {
+      const check = new Date(Date.UTC(+calendar[1], +calendar[2] - 1, +calendar[3]));
+      if (
+        check.getUTCFullYear() !== +calendar[1] ||
+        check.getUTCMonth() !== +calendar[2] - 1 ||
+        check.getUTCDate() !== +calendar[3]
+      ) {
+        throw new Error(`Cannot parse date '${s}' (invalid calendar date)`);
+      }
+    }
     const ts = Date.parse(s);
     if (Number.isNaN(ts)) throw new Error(`Cannot parse date '${s}'`);
     return ts;
   }
-  let iso: string;
-  if (s.includes(" ")) {
-    const m = s.match(/^(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2})(:\d{2})?$/);
-    if (!m) throw new Error(`Cannot parse date '${s}' (expected YYYY-MM-DD or YYYY-MM-DD HH:MM)`);
-    iso = `${m[1]}T${m[2]}${m[3] ?? ":00"}Z`;
-  } else {
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) {
-      throw new Error(`Cannot parse date '${s}' (expected YYYY-MM-DD)`);
-    }
-    iso = `${s}T00:00:00Z`;
+  const normalized = s.replace("T", " ");
+  const m = normalized.match(/^(\d{4})-(\d{2})-(\d{2})(?: (\d{2}):(\d{2})(?::(\d{2}))?)?$/);
+  if (!m) throw new Error(`Cannot parse date '${s}' (expected YYYY-MM-DD [HH:MM[:SS]])`);
+  const localUtc = Date.UTC(+m[1], +m[2] - 1, +m[3], +(m[4] ?? 0), +(m[5] ?? 0), +(m[6] ?? 0));
+  const check = new Date(localUtc);
+  if (
+    check.getUTCFullYear() !== +m[1] ||
+    check.getUTCMonth() !== +m[2] - 1 ||
+    check.getUTCDate() !== +m[3] ||
+    check.getUTCHours() !== +(m[4] ?? 0) ||
+    check.getUTCMinutes() !== +(m[5] ?? 0) ||
+    check.getUTCSeconds() !== +(m[6] ?? 0)
+  ) {
+    throw new Error(`Cannot parse date '${s}' (invalid calendar date)`);
   }
-  const ts = Date.parse(iso);
-  if (Number.isNaN(ts)) throw new Error(`Cannot parse date '${s}'`);
-  return ts;
+  if (typeof zone === "number") return localUtc - zone * 3600_000;
+
+  // Two passes account for the fact that the first UTC guess can fall on the
+  // other side of a daylight-saving transition.
+  let instant = localUtc;
+  for (let i = 0; i < 2; i++) {
+    const p = zonedParts(instant, zone);
+    const represented = Date.UTC(+p.year, +p.month - 1, +p.day, +p.hour, +p.minute, +p.second);
+    instant = localUtc - (represented - instant);
+  }
+  const final = zonedParts(instant, zone);
+  if (
+    +final.year !== +m[1] ||
+    +final.month !== +m[2] ||
+    +final.day !== +m[3] ||
+    +final.hour !== +(m[4] ?? 0) ||
+    +final.minute !== +(m[5] ?? 0) ||
+    +final.second !== +(m[6] ?? 0)
+  ) {
+    throw new Error(`Cannot parse date '${s}' (local time does not exist in ${zone})`);
+  }
+  return instant;
 }

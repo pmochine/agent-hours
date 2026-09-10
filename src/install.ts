@@ -23,32 +23,41 @@ its output. Run it from the project directory the user asks about.
 
 ## Commands
 
+Prefer the installed \`agent-hours\` executable when it is on PATH. Otherwise
+replace it below with \`npx agent-hours@latest\`.
+
 \`\`\`bash
-npx agent-hours --json                          # full three-state split, machine-readable
-npx agent-hours --worklog --csv --by-day        # per-day: hours per state + description
-npx agent-hours --worklog --csv                 # per-hour variant
-npx agent-hours --json --since 2026-06-01 --until 2026-06-30
-npx agent-hours --all-projects --split          # everything on this machine
+agent-hours --json                          # full three-state split, machine-readable
+agent-hours --worklog --csv --by-day        # per-day: hours per state + description
+agent-hours --worklog --csv                 # per-hour variant
+agent-hours --json --since 2026-06-01 --until 2026-06-30
+agent-hours --all-projects --source auto --split
+agent-hours --source codex --timezone Europe/Berlin --worklog-json
 \`\`\`
 
 ## How to answer
 
 1. **"How many hours did I work?"** — run \`--json\`. Present the BAND, never a
-   single number as truth: hands-on hours (provable lower bound), attention
-   hours (model estimate incl. supervised agent time), upper bound. Mention
-   total agent runtime separately.
+   single number as truth: direct-interaction estimate, attention estimate
+   (including evidence-weighted supervision), and inter-prompt upper estimate.
+   Mention total agent runtime separately.
 2. **"What did I work on?"** — run \`--worklog --csv --by-day\` (or per-hour for
    one day) and summarize the description column in your own words, grouped
    by theme. This is free — do NOT pass --summarize unless the user asks.
-3. **Invoice/billing export** — write the CSV to ~/Downloads and remind the
-   user: browser/call time is not in the logs, add 15–25 % on top.
+3. **Invoice/billing export** — write the CSV to the requested location and
+   state that browser, call, and unrelated editor time is absent. Reconcile
+   that time from calendar or other records; do not invent a fixed markup.
 
 ## Notes
 
-- Sources are merged into ONE timeline (Claude Code + Codex; parallel agents
-  and agent-launched agents never double-count).
+- \`--source auto\` merges Claude Code + Codex into ONE timeline; parallel
+  agents and agent-launched agents do not double-count wall-clock time.
+- Codex reads both active \`sessions\` and \`archived_sessions\` from
+  \`CODEX_HOME\` (default \`~/.codex\`) and deduplicates session IDs.
 - Claude Code prunes logs after cleanupPeriodDays (default 30) — if a range
   looks empty, say so and recommend raising it in ~/.claude/settings.json.
+- Local date ranges and buckets use the system IANA timezone by default. Pass
+  \`--timezone Europe/Berlin\` when a report must use a specific billing zone.
 - Idle-cap methodology: gaps between events capped at 10 min (configurable
   via --cap/--prompt-cap).
 `;
@@ -166,25 +175,33 @@ function installSkillFile(skillDir: string): InstallResult {
 
 /**
  * Installs the skill for the requested agents. `homeDir` is overridable for
- * tests. Codex is skipped (not failed) when ~/.codex doesn't exist.
+ * tests. Codex honors CODEX_HOME for the real user and is skipped (not failed)
+ * when the selected Codex home does not exist.
  */
 export function runInstall(
   agent: "claude" | "codex" | "all",
-  homeDir: string = os.homedir()
+  homeDir: string = os.homedir(),
+  codexHomeDir?: string
 ): InstallResult[] {
   const results: InstallResult[] = [];
   if (agent === "claude" || agent === "all") {
     results.push(installSkillFile(path.join(homeDir, ".claude", "skills")));
   }
   if (agent === "codex" || agent === "all") {
-    if (fs.existsSync(path.join(homeDir, ".codex"))) {
-      results.push(installSkillFile(path.join(homeDir, ".codex", "skills")));
+    const defaultHome = os.homedir();
+    const codexHome =
+      codexHomeDir ??
+      (homeDir === defaultHome && process.env["CODEX_HOME"]
+        ? process.env["CODEX_HOME"]!
+        : path.join(homeDir, ".codex"));
+    if (fs.existsSync(codexHome)) {
+      results.push(installSkillFile(path.join(codexHome, "skills")));
     } else {
       results.push({
-        target: path.join(homeDir, ".codex"),
+        target: codexHome,
         path: "",
         status: "skipped",
-        reason: "~/.codex not found (Codex CLI not installed)",
+        reason: `${codexHome} not found (Codex CLI not installed)`,
       });
     }
   }

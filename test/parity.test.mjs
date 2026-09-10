@@ -1,5 +1,5 @@
 /**
- * Golden-master parity: the same fixtures through the battle-tested Python
+ * Compatibility parity: the same legacy fixtures through the Python
  * prototype (reference/prototype-split.py) and the TypeScript port must
  * yield identical numbers. Skipped when python3 is not available.
  */

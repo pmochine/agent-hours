@@ -1,0 +1,2 @@
+{"timestamp":"2026-06-02T15:00:00.000Z","type":"session_meta","payload":{"id":"mcp-source","cwd":"/tmp/source-kinds","source":"mcp","cli_version":"0.154.0"}}
+{"timestamp":"2026-06-02T15:00:01.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"machine delegated prompt"}]}}

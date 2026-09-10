@@ -6,7 +6,17 @@
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { hourKey } from "./core.js";
+import {
+  hourKey,
+  isHumanPromptSource,
+  isMachineGeneratedText,
+  type TimeZoneSpec,
+} from "./core.js";
+import {
+  findCodexSessionFiles,
+  isSyntheticCodexUserText,
+  type CodexSessionBase,
+} from "./sources/codex.js";
 
 export interface HourLog {
   prompts: string[];
@@ -25,6 +35,27 @@ function excerpt(text: string, max = 90): string {
 
 function condenseCommand(cmd: string): string {
   return excerpt(cmd, 70);
+}
+
+function emptyHourLog(): HourLog {
+  return { prompts: [], filesEdited: new Set(), commands: [], commits: [], awaySummaries: [] };
+}
+
+function addCommand(log: HourLog, cmd: string): void {
+  if (/\bgit\s+commit\b/.test(cmd)) {
+    let m = cmd.match(/-m\s+["']([^"'$][^"']*)/);
+    if (!m) m = cmd.match(/<<\s*'?EOF'?\s*\n\s*([^\n]+)/);
+    if (m) {
+      log.commits.push(excerpt(m[1], 80));
+      return;
+    }
+  }
+  log.commands.push(condenseCommand(cmd));
+}
+
+function isUsefulWorklogPrompt(text: string): boolean {
+  const trimmed = text.trimStart();
+  return !trimmed.startsWith("<") && !trimmed.startsWith("[Request interrupted");
 }
 
 function jsonlFiles(projectDir: string): string[] {
@@ -55,14 +86,14 @@ export function collectWorklog(
   projectDir: string,
   sinceMs: number,
   untilMs: number,
-  tzOffsetHours: number
+  timeZone: TimeZoneSpec
 ): Map<string, HourLog> {
   const hours = new Map<string, HourLog>();
   const bucket = (ts: number): HourLog => {
-    const key = hourKey(ts, tzOffsetHours);
+    const key = hourKey(ts, timeZone);
     let b = hours.get(key);
     if (!b) {
-      b = { prompts: [], filesEdited: new Set(), commands: [], commits: [], awaySummaries: [] };
+      b = emptyHourLog();
       hours.set(key, b);
     }
     return b;
@@ -95,26 +126,27 @@ export function collectWorklog(
       if (!isSubagent && r["isSidechain"] !== true) {
         if (type === "user" && !r["isMeta"] && !r["isCompactSummary"]) {
           const src = r["promptSource"];
-          if (src === "typed" || src === undefined) {
+          if (isHumanPromptSource(src) || src === undefined) {
             const msg = r["message"] as Record<string, unknown> | undefined;
             const c = msg?.["content"];
             let text: string | null = null;
             if (typeof c === "string") text = c;
             else if (Array.isArray(c)) {
-              const t = c.find(
-                (i) => i && typeof i === "object" && (i as Record<string, unknown>)["type"] === "text"
-              ) as Record<string, unknown> | undefined;
+              const t = c.find((i) => {
+                if (!i || typeof i !== "object") return false;
+                const item = i as Record<string, unknown>;
+                return (
+                  item["type"] === "text" &&
+                  typeof item["text"] === "string" &&
+                  isUsefulWorklogPrompt(item["text"] as string)
+                );
+              }) as Record<string, unknown> | undefined;
               const hasToolResult = c.some(
                 (i) => i && typeof i === "object" && (i as Record<string, unknown>)["type"] === "tool_result"
               );
               if (t && !hasToolResult) text = String(t["text"] ?? "");
             }
-            if (
-              text &&
-              !text.startsWith("[Request interrupted") &&
-              !text.trimStart().startsWith("<command-") &&
-              !text.trimStart().startsWith("<local-command")
-            ) {
+            if (text && isUsefulWorklogPrompt(text)) {
               bucket(ts).prompts.push(excerpt(text));
             }
           }
@@ -123,7 +155,7 @@ export function collectWorklog(
           type === "queue-operation" &&
           r["operation"] === "enqueue" &&
           typeof r["content"] === "string" &&
-          !(r["content"] as string).trimStart().startsWith("<task-notification")
+          !isMachineGeneratedText(r["content"] as string)
         ) {
           bucket(ts).prompts.push(excerpt(r["content"] as string));
         }
@@ -147,24 +179,178 @@ export function collectWorklog(
           if (EDIT_TOOLS.has(name) && typeof input["file_path"] === "string") {
             bucket(ts).filesEdited.add(input["file_path"] as string);
           } else if (name === "Bash" && typeof input["command"] === "string") {
-            const cmd = input["command"] as string;
-            if (/git commit/.test(cmd)) {
-              // plain -m "msg" first; heredoc style (-m "$(cat <<EOF ... )")
-              // falls through to the first heredoc line as the subject
-              let m = cmd.match(/-m\s+["']([^"'$][^"']*)/);
-              if (!m) m = cmd.match(/<<\s*'?EOF'?\s*\n\s*([^\n]+)/);
-              if (m) {
-                bucket(ts).commits.push(excerpt(m[1], 80));
-                continue;
-              }
-            }
-            bucket(ts).commands.push(condenseCommand(cmd));
+            addCommand(bucket(ts), input["command"] as string);
           }
         }
       }
     }
   }
   return hours;
+}
+
+function codexMessageText(payload: Record<string, unknown>): string | null {
+  const content = payload["content"];
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return null;
+  const parts = content
+    .filter((c): c is Record<string, unknown> => !!c && typeof c === "object")
+    .filter((c) => c["type"] === "input_text" || c["type"] === "text")
+    .map((c) => c["text"])
+    .filter((t): t is string => typeof t === "string")
+    .filter((t) => !isSyntheticCodexUserText(t));
+  return parts.length ? parts.join("\n") : null;
+}
+
+function codexCommand(item: Record<string, unknown>): string | null {
+  const command = item["command"];
+  if (typeof command === "string") return command;
+  if (Array.isArray(command)) {
+    const strings = command.filter((v): v is string => typeof v === "string");
+    return strings.length ? strings[strings.length - 1] : null;
+  }
+  return null;
+}
+
+function codexContentText(value: unknown): string | null {
+  if (typeof value === "string") return value;
+  if (!Array.isArray(value)) return null;
+  const parts = value
+    .filter((part): part is Record<string, unknown> => !!part && typeof part === "object")
+    .filter((part) => part["type"] === "text" || part["type"] === "output_text")
+    .map((part) => part["text"])
+    .filter((text): text is string => typeof text === "string");
+  return parts.length ? parts.join("\n") : null;
+}
+
+function addPatchFiles(log: HourLog, patchText: string): void {
+  for (const line of patchText.split("\n")) {
+    const match = line.match(/^\*\*\* (?:Add|Update|Delete) File:\s+(.+?)\s*$/);
+    if (match) log.filesEdited.add(match[1]);
+  }
+}
+
+function parseArguments(value: unknown): Record<string, unknown> | null {
+  if (value && typeof value === "object") return value as Record<string, unknown>;
+  if (typeof value !== "string") return null;
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Collects worklog evidence from current and legacy Codex rollout schemas. */
+export function collectCodexWorklog(
+  projectPath: string,
+  sinceMs: number,
+  untilMs: number,
+  timeZone: TimeZoneSpec,
+  baseDir?: CodexSessionBase
+): Map<string, HourLog> {
+  const hours = new Map<string, HourLog>();
+  const bucket = (ts: number): HourLog => {
+    const key = hourKey(ts, timeZone);
+    let b = hours.get(key);
+    if (!b) {
+      b = emptyHourLog();
+      hours.set(key, b);
+    }
+    return b;
+  };
+
+  for (const meta of findCodexSessionFiles(projectPath, sinceMs, untilMs, baseDir)) {
+    let raw: string;
+    try {
+      raw = fs.readFileSync(meta.file, "utf8");
+    } catch {
+      continue;
+    }
+    const effectiveSince = meta.subagent ? Math.max(sinceMs, meta.startedAt) : sinceMs;
+    const seenCommandCalls = new Set<string>();
+    for (const line of raw.split("\n")) {
+      if (!line.trim()) continue;
+      let r: Record<string, unknown>;
+      try {
+        r = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      const tsStr = r["timestamp"];
+      if (typeof tsStr !== "string") continue;
+      const ts = Date.parse(tsStr);
+      if (Number.isNaN(ts) || ts < effectiveSince || ts > untilMs) continue;
+      const payload = (r["payload"] ?? {}) as Record<string, unknown>;
+
+      if (r["type"] === "response_item") {
+        if (meta.interactive && payload["type"] === "message" && payload["role"] === "user") {
+          const text = codexMessageText(payload);
+          if (text && !isSyntheticCodexUserText(text)) bucket(ts).prompts.push(excerpt(text));
+        }
+
+        // Legacy Codex tool-call schema. Newer logs expose richer normalized
+        // item_completed records below, so this is intentionally conservative.
+        if (payload["type"] === "function_call" || payload["type"] === "custom_tool_call") {
+          const name = String(payload["name"] ?? "");
+          const callId = payload["call_id"] ?? payload["id"];
+          const rawInput = payload["arguments"] ?? payload["input"];
+          const args = parseArguments(rawInput);
+          if ((name === "exec_command" || name === "shell" || name === "Bash") && args) {
+            const cmd = args["cmd"] ?? args["command"];
+            const normalized = codexCommand({ command: cmd });
+            if (normalized && (typeof callId !== "string" || !seenCommandCalls.has(callId))) {
+              addCommand(bucket(ts), normalized);
+              if (typeof callId === "string") seenCommandCalls.add(callId);
+            }
+          } else if (name === "apply_patch") {
+            const patchText =
+              (args && (args["patch"] ?? args["input"])) ??
+              (typeof rawInput === "string" && !args ? rawInput : null);
+            if (typeof patchText === "string") addPatchFiles(bucket(ts), patchText);
+          }
+        }
+        continue;
+      }
+
+      if (r["type"] !== "event_msg" || payload["type"] !== "item_completed") continue;
+      const item = (payload["item"] ?? {}) as Record<string, unknown>;
+      const itemType = item["type"];
+      if (itemType === "CommandExecution") {
+        const callId = item["id"] ?? item["call_id"];
+        if (typeof callId === "string" && seenCommandCalls.has(callId)) continue;
+        const cmd = codexCommand(item);
+        if (cmd) {
+          addCommand(bucket(ts), cmd);
+          if (typeof callId === "string") seenCommandCalls.add(callId);
+        }
+      } else if (itemType === "FileChange") {
+        const changes = item["changes"];
+        if (changes && typeof changes === "object" && !Array.isArray(changes)) {
+          for (const file of Object.keys(changes as Record<string, unknown>)) {
+            bucket(ts).filesEdited.add(file);
+          }
+        }
+      } else if (itemType === "AgentMessage" && item["phase"] === "final_answer") {
+        const content = codexContentText(item["content"]);
+        if (content && content.trim()) {
+          bucket(ts).awaySummaries.push(excerpt(content, 200));
+        }
+      }
+    }
+  }
+  return hours;
+}
+
+/** Merge evidence maps from several agent sources without losing file sets. */
+export function mergeWorklogMaps(maps: Map<string, HourLog>[]): Map<string, HourLog> {
+  const out = new Map<string, HourLog>();
+  for (const map of maps) {
+    for (const [key, log] of map) {
+      const current = out.get(key);
+      out.set(key, current ? mergeLogs([current, log]) : mergeLogs([log]));
+    }
+  }
+  return out;
 }
 
 /** Shortens file paths to a common-sense display form (basename + parent). */
@@ -175,13 +361,7 @@ export function shortPath(p: string): string {
 
 /** Merges several hour buckets into one (for day/project aggregation). */
 export function mergeLogs(logs: HourLog[]): HourLog {
-  const out: HourLog = {
-    prompts: [],
-    filesEdited: new Set(),
-    commands: [],
-    commits: [],
-    awaySummaries: [],
-  };
+  const out = emptyHourLog();
   for (const l of logs) {
     out.prompts.push(...l.prompts);
     for (const f of l.filesEdited) out.filesEdited.add(f);

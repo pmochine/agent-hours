@@ -1,0 +1,2 @@
+{"timestamp":"2026-06-02T14:00:00.000Z","type":"session_meta","payload":{"id":"missing-source","cwd":"/tmp/source-kinds","cli_version":"0.120.0"}}
+{"timestamp":"2026-06-02T14:00:01.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"legacy human prompt"}]}}

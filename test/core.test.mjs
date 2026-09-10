@@ -9,15 +9,22 @@ import {
   classifyRecord,
   computeRefinedSplit,
   computeSplit,
+  dayKey,
   detectOverlaps,
+  findClaudeProjectDirs,
   findPauses,
+  hourKey,
   loadProject,
   mergeEvents,
   parseDate,
   projectToHash,
 } from "../dist/core.js";
-import { collectWorklog, describeLog, mergeLogs } from "../dist/worklog.js";
-import { loadCodexSessions } from "../dist/sources/codex.js";
+import { collectCodexWorklog, collectWorklog, describeLog, mergeLogs } from "../dist/worklog.js";
+import {
+  canonicalProjectPath,
+  loadCodexSessions,
+  scanCodexSessions,
+} from "../dist/sources/codex.js";
 import { runInstall, SKILL_MD, checkRetention, setRetention } from "../dist/install.js";
 import fs from "node:fs";
 import os from "node:os";
@@ -25,6 +32,7 @@ import os from "node:os";
 const FIXTURES = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures");
 const LEGACY = path.join(FIXTURES, "legacy");
 const MODERN = path.join(FIXTURES, "modern");
+const CODEX_CURRENT = path.join(FIXTURES, "codex-current");
 const SINCE = 0;
 const UNTIL = Date.parse("2100-01-01T00:00:00Z");
 
@@ -64,10 +72,42 @@ test("classify: legacy shape heuristic (no promptSource)", () => {
 
 test("classify: promptSource overrides the shape heuristic", () => {
   assert.equal(classifyKind({ type: "user", promptSource: "typed", message: { content: "x" } }), "prompt");
+  assert.equal(
+    classifyKind({ type: "user", promptSource: "suggestion_accepted", message: { content: "x" } }),
+    "prompt"
+  );
   // phantom prompts: scheduled tasks / hooks delivered as user messages
   assert.equal(classifyKind({ type: "user", promptSource: "system", message: { content: "x" } }), "work");
   // queued injection: typing already credited at the enqueue event
   assert.equal(classifyKind({ type: "user", promptSource: "queued", message: { content: "x" } }), "work");
+  assert.equal(classifyKind({ type: "user", promptSource: "sdk", message: { content: "x" } }), "work");
+});
+
+test("classify: legacy machine envelopes do not become human prompts", () => {
+  for (const text of [
+    "<task-notification>done</task-notification>",
+    "<local-command-stdout>ok</local-command-stdout>",
+    "<command-name>/review</command-name>",
+    "<system-reminder>automated</system-reminder>",
+  ]) {
+    assert.equal(classifyKind({ type: "user", message: { content: text } }), "work");
+  }
+  assert.equal(
+    classifyKind({ type: "user", message: { content: "<bash-input>git status</bash-input>" } }),
+    "prompt"
+  );
+  assert.equal(
+    classifyKind({ type: "user", message: { content: "[Request interrupted by user]" } }),
+    "prompt"
+  );
+  assert.equal(
+    classifyKind({
+      type: "queue-operation",
+      operation: "enqueue",
+      content: "<cross-session-message>worker done</cross-session-message>",
+    }),
+    "work"
+  );
 });
 
 test("classify: queue-operation enqueue = human typing mid-turn", () => {
@@ -150,9 +190,80 @@ test("modern fixtures: refined split rewards watch evidence", () => {
   const merged = mergeEvents(loadProject(MODERN, SINCE, UNTIL));
   const r = computeRefinedSplit(merged, { capMinutes: 10, promptCapMinutes: 10, tzOffsetHours: 0 });
   assert.equal(r.totalMinutes, 10);
-  assert.equal(r.handsOnMinutes, 1.5);
-  // fast reaction (30s) + presence proof (external edit) => both segments fully supervised
-  assert.equal(r.supervisedMinutes, 8.5);
+  assert.equal(r.handsOnMinutes, 4);
+  // Same-session reaction avoids treating the parallel subagent as proof of a
+  // 30-second response; the later external edit remains real presence proof.
+  assert.equal(r.supervisedMinutes, 5.5);
+  assert.equal(r.aiAutonomousMinutes, 0.5);
+});
+
+test("refined split ignores background-session noise for reaction evidence", () => {
+  const base = Date.parse("2026-06-01T10:00:00Z");
+  const main = {
+    name: "main",
+    events: [
+      { ts: base, kind: "prompt", presence: true },
+      { ts: base + 60_000, kind: "work", presence: false, reactionAnchor: true },
+      { ts: base + 9 * 60_000, kind: "prompt", presence: true },
+    ],
+  };
+  const background = {
+    name: "background",
+    events: Array.from({ length: 47 }, (_, i) => ({
+      ts: base + (70 + i * 10) * 1000,
+      kind: "work",
+      // Foreign-session presence must not prove the main session was watched.
+      presence: i === 20,
+      reactionAnchor: true,
+    })),
+  };
+  const r = computeRefinedSplit(mergeEvents([main, background]), {
+    capMinutes: 10,
+    promptCapMinutes: 10,
+    timeZone: "UTC",
+  });
+  assert.equal(r.supervisedMinutes, 0);
+  assert.equal(r.handsOnMinutes, 8);
+});
+
+test("refined split preserves non-negative global and hourly invariants for unequal caps", () => {
+  const events = [
+    { ts: minutes(0)[0], kind: "prompt", presence: true },
+    { ts: minutes(1)[0], kind: "work", presence: false, reactionAnchor: true },
+    { ts: minutes(31)[0], kind: "prompt", presence: true },
+  ];
+  for (const [capMinutes, promptCapMinutes] of [[5, 10], [10, 5], [10, 60], [10, 10]]) {
+    const r = computeRefinedSplit(events, { capMinutes, promptCapMinutes, timeZone: "UTC" });
+    assert.ok(r.handsOnMinutes >= 0 && r.supervisedMinutes >= 0 && r.aiAutonomousMinutes >= 0);
+    assert.ok(Math.abs(r.handsOnMinutes + r.supervisedMinutes + r.aiAutonomousMinutes - r.totalMinutes) < 1e-9);
+    const sums = [...r.byHour.values()].reduce(
+      (a, h) => ({
+        total: a.total + h.total,
+        handsOn: a.handsOn + h.handsOn,
+        supervised: a.supervised + h.supervised,
+        ai: a.ai + h.ai,
+      }),
+      { total: 0, handsOn: 0, supervised: 0, ai: 0 }
+    );
+    assert.ok(Math.abs(sums.total - r.totalMinutes) < 1e-9);
+    assert.ok(Math.abs(sums.handsOn - r.handsOnMinutes) < 1e-9);
+    assert.ok(Math.abs(sums.supervised - r.supervisedMinutes) < 1e-9);
+    assert.ok(Math.abs(sums.ai - r.aiAutonomousMinutes) < 1e-9);
+  }
+});
+
+test("refined split falls back to the previous same-session prompt when no answer exists", () => {
+  const events = [
+    { ts: minutes(0)[0], kind: "prompt", presence: true, session: "main" },
+    { ts: minutes(3)[0], kind: "prompt", presence: true, session: "main" },
+  ];
+  const r = computeRefinedSplit(events, {
+    capMinutes: 10,
+    promptCapMinutes: 10,
+    timeZone: "UTC",
+  });
+  assert.equal(r.handsOnMinutes, 3);
+  assert.equal(r.supervisedMinutes, 0);
   assert.equal(r.aiAutonomousMinutes, 0);
 });
 
@@ -192,6 +303,58 @@ test("codex adapter: cwd matching, exec vs interactive, tag filtering", () => {
   assert.ok(exec.events.every((e) => e.kind === "work"));
 });
 
+test("current Codex logs: subagents, multipart prompts, archives, and deduplication", () => {
+  const bases = [
+    path.join(CODEX_CURRENT, "sessions"),
+    path.join(CODEX_CURRENT, "archived_sessions"),
+  ];
+  const scanned = scanCodexSessions(SINCE, UNTIL, bases);
+  assert.deepEqual(scanned.map((s) => s.sessionId).sort(), ["archived-only", "current-main", "current-sub"]);
+
+  const sessions = loadCodexSessions("/tmp/proj-current", SINCE, UNTIL, bases);
+  assert.equal(sessions.length, 3);
+  assert.equal(sessions.flatMap((s) => s.events).filter((e) => e.kind === "prompt").length, 2);
+  const sub = scanned.find((s) => s.sessionId === "current-sub");
+  assert.ok(sub);
+  assert.equal(sub.subagent, true);
+  assert.ok(sub.session.events.every((e) => e.kind === "work"));
+  assert.ok(sub.session.events.every((e) => e.ts >= sub.startedAt));
+});
+
+test("Codex source classification keeps legacy humans and rejects MCP automation", () => {
+  const dir = path.join(FIXTURES, "codex-source-kinds");
+  const scanned = scanCodexSessions(SINCE, UNTIL, dir);
+  const legacy = scanned.find((s) => s.sessionId === "missing-source");
+  const mcp = scanned.find((s) => s.sessionId === "mcp-source");
+  assert.ok(legacy?.interactive);
+  assert.equal(legacy.session.events.filter((e) => e.kind === "prompt").length, 1);
+  assert.equal(mcp?.interactive, false);
+  assert.ok(mcp.session.events.every((e) => e.kind === "work"));
+});
+
+test("Codex worklog extracts evidence from current and archived schemas", () => {
+  const bases = [
+    path.join(CODEX_CURRENT, "sessions"),
+    path.join(CODEX_CURRENT, "archived_sessions"),
+  ];
+  const log = collectCodexWorklog("/tmp/proj-current", SINCE, UNTIL, "UTC", bases);
+  const all = mergeLogs([...log.values()]);
+  assert.deepEqual(all.prompts.sort(), ["fix the current bug", "review archived work"]);
+  assert.deepEqual([...all.filesEdited].sort(), [
+    "/tmp/proj-current/src/app.ts",
+    "/tmp/proj-current/src/extra.ts",
+    "/tmp/proj-current/src/helper.ts",
+  ]);
+  assert.equal(all.commands.filter((command) => command === "npm test").length, 1);
+  assert.deepEqual(all.commits, ["Archive fix"]);
+  assert.match(all.awaySummaries[0], /Fixed the current bug/);
+});
+
+test("Codex project matching normalizes NFC and NFD paths", () => {
+  const composed = "/tmp/manuel-m" + String.fromCharCode(0x00fc) + "hl";
+  assert.equal(canonicalProjectPath(composed), canonicalProjectPath(composed.normalize("NFD")));
+});
+
 test("install: writes skills, skips missing codex, is idempotent", () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "ah-test-"));
   try {
@@ -207,6 +370,20 @@ test("install: writes skills, skips missing codex, is idempotent", () => {
     assert.equal(results[1].status, "installed");
   } finally {
     fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("install: honors an explicit CODEX_HOME without leaking the real environment", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "ah-home-"));
+  const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), "ah-codex-home-"));
+  try {
+    const results = runInstall("codex", home, codexHome);
+    assert.equal(results[0].status, "installed");
+    assert.equal(results[0].path, path.join(codexHome, "skills", "agent-hours", "SKILL.md"));
+    assert.equal(fs.readFileSync(results[0].path, "utf8"), SKILL_MD);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(codexHome, { recursive: true, force: true });
   }
 });
 
@@ -263,6 +440,30 @@ test("parseDate handles the three accepted formats", () => {
   assert.equal(parseDate("2026-06-01 10:30"), Date.parse("2026-06-01T10:30:00Z"));
   assert.equal(parseDate("2026-06-01T10:30:00Z"), Date.parse("2026-06-01T10:30:00Z"));
   assert.throws(() => parseDate("garbage"));
+  assert.throws(() => parseDate("2026-13-01"));
+  assert.throws(() => parseDate("2026-02-30 12:00"));
+  assert.throws(() => parseDate("2026-02-30T12:00:00Z"));
+  assert.throws(() => parseDate("2026-03-29 02:30", "Europe/Berlin"), /does not exist/);
+});
+
+test("IANA timezone parsing and buckets follow Berlin winter and summer time", () => {
+  assert.equal(
+    parseDate("2026-01-15 12:00", "Europe/Berlin"),
+    Date.parse("2026-01-15T11:00:00Z")
+  );
+  assert.equal(
+    parseDate("2026-07-15 12:00", "Europe/Berlin"),
+    Date.parse("2026-07-15T10:00:00Z")
+  );
+  assert.equal(dayKey(Date.parse("2026-01-01T23:30:00Z"), "Europe/Berlin"), "2026-01-02");
+  assert.equal(hourKey(Date.parse("2026-07-15T22:30:00Z"), "Europe/Berlin"), "2026-07-16 00:00");
+});
+
+test("IANA buckets reflect both sides of daylight-saving transitions", () => {
+  assert.equal(hourKey(Date.parse("2026-03-29T00:30:00Z"), "Europe/Berlin"), "2026-03-29 01:00");
+  assert.equal(hourKey(Date.parse("2026-03-29T01:30:00Z"), "Europe/Berlin"), "2026-03-29 03:00");
+  assert.equal(hourKey(Date.parse("2026-10-25T00:30:00Z"), "Europe/Berlin"), "2026-10-25 02:00");
+  assert.equal(hourKey(Date.parse("2026-10-25T01:30:00Z"), "Europe/Berlin"), "2026-10-25 02:00");
 });
 
 test("projectToHash matches Claude Code's directory naming", () => {
@@ -282,4 +483,30 @@ test("projectToHash sanitizes every non-alphanumeric char (regression: umlauts)"
   assert.equal(projectToHash(base.normalize("NFD")), want);
   assert.equal(projectToHash("/x/my.repo"), "-x-my-repo");
   assert.equal(projectToHash("/x/a b"), "-x-a-b"); // space -> dash
+});
+
+test("Claude descendant-project discovery confirms cwd and excludes hash-prefix siblings", () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "ah-projects-"));
+  try {
+    const project = path.join(base, "target-project");
+    const cases = [
+      [projectToHash(project), project],
+      [projectToHash(project + "/sub"), project + "/sub"],
+      [projectToHash(project + "-sibling"), project + "-sibling"],
+    ];
+    for (const [name, cwd] of cases) {
+      const dir = path.join(base, name);
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(
+        path.join(dir, "session.jsonl"),
+        JSON.stringify({ type: "assistant", timestamp: "2026-01-01T00:00:00Z", cwd }) + "\n"
+      );
+    }
+    assert.deepEqual(
+      findClaudeProjectDirs(project, base).map((p) => path.basename(p)).sort(),
+      [projectToHash(project), projectToHash(project + "/sub")].sort()
+    );
+  } finally {
+    fs.rmSync(base, { recursive: true, force: true });
+  }
 });

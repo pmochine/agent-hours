@@ -1,13 +1,13 @@
 {
   "name": "agent-hours",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/pmochine/agent-hours.git"
   },
   "homepage": "https://github.com/pmochine/agent-hours#readme",
   "bugs": "https://github.com/pmochine/agent-hours/issues",
-  "description": "Billable hours from your local coding-agent session logs (Claude Code today) — with the three-state split no other tool gives you: hands-on / supervised / AI-autonomous.",
+  "description": "Billable hours and worklogs from local Claude Code and Codex session logs, with an evidence-based hands-on / supervised / AI-autonomous split.",
   "type": "module",
   "bin": {
     "agent-hours": "dist/cli.js"
