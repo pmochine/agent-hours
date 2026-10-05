@@ -29,12 +29,17 @@ All notable changes are documented here, following [Keep a Changelog](https://ke
 
 ## [0.5.0] - 2026-09-10
 
-- Robust Codex support, archived sessions, source filtering, and the evidence-based three-state split.
+- Robust Codex support: archived sessions, subagent and MCP sources, multipart prompts, deduplication by session.
+- IANA time zones with daylight-saving-aware ranges and buckets; `--tz-offset` kept as a fixed-offset mode.
 
 ## [0.4.0] - 2026-06-18
 
-- Installer checks Claude log retention and offers a safe increase to 365 days.
+- `install` checks Claude log retention and offers a safe increase to 365 days.
 
-## [0.3.x] - 2026-06-12
+## [0.3.1] - 2026-06-13
 
-- Initial local hours CLI with merged timelines, worklogs, CSV/JSON exports, and agent skill installation.
+- Project matching handles directories with special characters (non-alphanumeric replacement and NFC normalization).
+
+## [0.3.0] - 2026-06-12
+
+- First public release: merged Claude and Codex timelines, the three-state human/AI split, hourly worklogs, CSV/JSON exports, agent skill installation and the Claude Code plugin.

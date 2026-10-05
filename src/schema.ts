@@ -99,6 +99,11 @@ export const KNOWN_CLAUDE_KINDS = new Set([
   "system|scheduled_task_fire||", // Scheduled-task trigger; machine bookkeeping.
   "system|stop_hook_summary||",
   "system|turn_duration||",
+  // Seen on 2026-10-05 with full sampling; bookkeeping next to agent activity.
+  "attachment||max_turns_reached|",
+  "attachment||plan_mode|",
+  "attachment||structured_output|",
+  "system|api_error||",
 ]);
 
 export const KNOWN_CODEX_KINDS = new Set([
@@ -145,6 +150,7 @@ export const KNOWN_PROMPT_SOURCES = new Set(["typed", "suggestion_accepted", "sy
 // Handled session routing plus observed bookkeeping originators and source shapes.
 export const KNOWN_ORIGINATORS = new Set(["(missing)", "Claude Code", "codex_exec", "Codex Desktop", "codex-tui",
   "codex_work_desktop", // Human desktop front-end.
+  "codex_cli_rs", // Codex CLI front-end used interactively.
 ]);
 export const KNOWN_CODEX_SOURCES = new Set(["(missing)", "cli", "exec", "mcp", "vscode", "subagent.spawn", "subagent.other",
   "subagent.thread_spawn", // Subagent; already treated as machine by isSubagentSource.
