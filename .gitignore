@@ -6,4 +6,3 @@ dist/
 # local-only: internal planning & strategy (contains client context)
 /PLAN.md
 /MARKETING.md
-/prototype-split.py

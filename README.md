@@ -35,6 +35,7 @@ Existing tools don't answer this:
 | WakaTime agent plugins | coding activity dashboards | no billing split, not retroactive, cloud service |
 | Claude Code OpenTelemetry | `active_time` metrics | needs Prometheus/Grafana, only logs from activation onward |
 | ccusage | tokens & API cost | no hours at all |
+| Estela | billable hours from Claude Code, Codex and Copilot logs, clients, rates, PDF | no human/AI split, gap-based blocks only |
 
 `agent-hours` is local, retroactive, billing-oriented — and it refuses to pretend one fake-precise number is the truth.
 
@@ -43,8 +44,8 @@ Existing tools don't answer this:
 - **Three-state human/AI split** — direct interaction (capped reaction-time estimate), supervised (evidence-weighted), and AI-autonomous; the older inter-prompt heuristic is shown as an upper estimate, so you get a transparent band rather than fake precision.
 - **Multi-agent, one timeline** — Claude Code and Codex CLI sessions merge into a single timeline. Parallel agents never double-count wall-clock time; an agent launched *by* another agent counts as AI runtime, not as you.
 - **Hourly worklog** — what was done per hour: your prompts, edited files (incl. subagents), commands, commit messages, and the away-summaries the agent itself wrote.
-- **Descriptions with or without AI** — rule-based summaries are the default (deterministic, free, reproducible). `--summarize` optionally refines them via `claude -p` — the only feature that costs API money, strictly opt-in. Or pipe `--worklog-json` into the AI chat you're already paying for.
-- **Exports** — CSV (hours/days, with description column and project GESAMT row), JSON, markdown worklog.
+- **Descriptions with or without AI** — rule-based summaries are the default (deterministic, free, reproducible). `--summarize` optionally refines them via `claude -p` — the only feature that costs API money, strictly opt-in. It is also the only feature that sends data off the machine: prompt excerpts, file paths and commit messages go to Claude via `claude -p`. Or pipe `--worklog-json` into the AI chat you're already paying for.
+- **Exports** — CSV (hours/days, with description column and project total row; English headers by default, `--lang de` for German headers), JSON, markdown worklog.
 - **Regression-tested timekeeping core** — merged-timeline idle-cap math, parallel-session detection, pause analysis, cap-bonus vs. strict columns, per-session breakdown.
 - **All projects at a glance** — `--all-projects` ranks everything on your machine.
 
@@ -71,11 +72,12 @@ From then on, questions like *"What did I work on this week?"* or *"Export a CSV
 /plugin install agent-hours
 ```
 
-**Level 3 — raw CLI**, no agent involved:
+**Level 3 — raw CLI**, no agent involved — see Usage below.
 
 ## Usage
 
 ```bash
+npx agent-hours install [claude|codex|all] # install the skill for selected agents
 npx agent-hours                    # current project, hours at several idle caps
 npx agent-hours --split            # direct interaction / supervised / AI-autonomous
 npx agent-hours --by-day --split   # per-day table with split
@@ -89,9 +91,10 @@ npx agent-hours --worklog-json             # structured + LLM prompt template
 
 # exports & scope
 npx agent-hours --csv > hours.csv          # plain per-day CSV (invoice tools)
+npx agent-hours --csv --lang de            # German CSV headers
 npx agent-hours --json                     # machine-readable, full split
 npx agent-hours --since 2026-06-08 --until 2026-06-12
-npx agent-hours --project /path/to/repo
+npx agent-hours --project <path|hash>      # project path or Claude project hash
 npx agent-hours --source claude|codex|auto # default auto: merge all agents
 npx agent-hours --all-projects --source auto --split
 
@@ -100,6 +103,7 @@ npx agent-hours --cap 10 --prompt-cap 10 --timezone Europe/Berlin
 npx agent-hours --tz-offset 2                 # fixed-offset compatibility mode
 npx agent-hours --by-session               # parallel sessions, per-file
 npx agent-hours --pauses                   # longest gaps > cap
+npx agent-hours --pauses --top-pauses <n>  # number of pauses to list
 ```
 
 ## Methodology
@@ -114,7 +118,7 @@ npx agent-hours --pauses                   # longest gaps > cap
 
 What you bill is your decision; the tool gives you the evidence and the band.
 
-Classification details verified against current and legacy logs: scheduled-task, SDK, hook, command-envelope, and task-notification records are filtered out; queued messages are credited at the moment you *typed* them; compact-continuation summaries don't count; and Claude/Codex subagent plus Codex `exec` sessions count entirely as machine work. Multipart Codex messages keep their human text while dropping injected context blocks.
+Classification details verified against current and legacy logs: scheduled-task, SDK, hook, command-envelope, and task-notification records are filtered out; queued messages are credited at the moment you *typed* them; compact-continuation summaries don't count; and Claude/Codex subagent plus Codex `exec` and `mcp` sessions count entirely as machine work. Multipart Codex messages keep their human text while dropping injected context blocks.
 
 ## Sources
 
@@ -122,9 +126,11 @@ Classification details verified against current and legacy logs: scheduled-task,
 |---|---|---|
 | Claude Code | ✅ | `~/.claude/projects/<hash>/*.jsonl` + `<session>/subagents/` |
 | Codex CLI | ✅ | `$CODEX_HOME/sessions/**.jsonl` + `$CODEX_HOME/archived_sessions/**.jsonl` (default home: `~/.codex`, matched via `cwd`, deduplicated by session ID) |
-| Gemini CLI, opencode, Cursor, Aider | planned | adapter interface in `src/sources/` |
+| Gemini CLI, opencode, Cursor, Aider | planned | see adapter notes below |
 
-Adding an agent = one adapter file that yields `{timestamp, kind: prompt|work, presence}` events. PRs welcome.
+Adapter contract: `{ts, kind: prompt|work, presence, reactionAnchor}` events in `src/sources/`, plus worklog extraction in `src/worklog.ts` and wiring in `src/cli.ts`. The Claude Code adapter currently lives in `src/core.ts`; adapters return events inside `NamedSession[]`, and merging attaches session identity. PRs welcome.
+
+Sessions started in subdirectories of the project are included for both Claude and Codex.
 
 ## Retroactive use & log retention
 
@@ -156,7 +162,7 @@ Rule of thumb: run exports when you invoice and archive the CSV/JSON next to the
 
 ## Verification
 
-The original Python implementation ships in [`reference/`](reference/) as a compatibility reference for the legacy binary split. The test suite also has direct regression coverage for the current three-state model, current Claude/Codex schemas, archives, subagents, source filtering, cap invariants, project matching, and daylight-saving behavior (`npm test`).
+The test suite has direct regression coverage for the current three-state model, current Claude/Codex schemas, archives, subagents, source filtering, cap invariants, project matching, and daylight-saving behavior (`npm test`).
 
 ## License
 

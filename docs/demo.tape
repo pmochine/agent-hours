@@ -12,7 +12,8 @@ Set Theme "Catppuccin Mocha"
 Set TypingSpeed 45ms
 
 Hide
-Type `mkdir -p /tmp/bin && printf '#!/bin/sh\nexec node /Users/shadrix/Documents/Coding/my-projects/claude-hours-cli/dist/cli.js "$@"\n' > /tmp/bin/agent-hours && chmod +x /tmp/bin/agent-hours && export PATH=/tmp/bin:$PATH HOME=/tmp/ah-demo-home && cd ~/projects/acme-shop && clear`
+# vhs runs from the repo root.
+Type `export AH_REPO="$(pwd)" && mkdir -p /tmp/bin && printf '#!/bin/sh\nexec node "$AH_REPO/dist/cli.js" "$@"\n' > /tmp/bin/agent-hours && chmod +x /tmp/bin/agent-hours && export PATH=/tmp/bin:$PATH HOME=/tmp/ah-demo-home && cd ~/projects/acme-shop && clear`
 Enter
 Sleep 2s
 Show

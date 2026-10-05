@@ -8,7 +8,6 @@ import {
   classifyKind,
   classifyRecord,
   computeRefinedSplit,
-  computeSplit,
   dayKey,
   detectOverlaps,
   findClaudeProjectDirs,
@@ -150,13 +149,12 @@ test("legacy fixtures: merged timeline avoids double counting parallel sessions"
   assert.equal(sum, 18);
 });
 
-test("legacy fixtures: binary split (upper-bound heuristic)", () => {
+test("legacy fixtures: refined split preserves frozen totals and upper bound", () => {
   const merged = mergeEvents(loadProject(LEGACY, SINCE, UNTIL));
-  const split = computeSplit(merged, 10, 10);
+  const split = computeRefinedSplit(merged, { capMinutes: 10, promptCapMinutes: 10 });
   assert.equal(split.totalMinutes, 16);
   assert.equal(split.promptCount, 2);
-  assert.equal(split.humanMinutes, 10);
-  assert.equal(split.aiSoloMinutes, 6);
+  assert.equal(split.upperBoundMinutes, 10);
 });
 
 test("legacy fixtures: refined three-state split", () => {
@@ -351,7 +349,7 @@ test("Codex worklog extracts evidence from current and archived schemas", () => 
 });
 
 test("Codex project matching normalizes NFC and NFD paths", () => {
-  const composed = "/tmp/manuel-m" + String.fromCharCode(0x00fc) + "hl";
+  const composed = "/tmp/m" + String.fromCharCode(0x00fc) + "ller";
   assert.equal(canonicalProjectPath(composed), canonicalProjectPath(composed.normalize("NFD")));
 });
 
@@ -474,8 +472,8 @@ test("projectToHash sanitizes every non-alphanumeric char (regression: umlauts)"
   // Claude Code replaces EVERY non-alphanumeric with "-", not just "/".
   // Build the path from code points so the source stays pure ASCII.
   const u = String.fromCharCode(0x00fc); // ü (NFC, single code point)
-  const base = `/Users/shadrix/Documents/Coding/Cofana/manuel-m${u}hlhoffs-bot`;
-  const want = "-Users-shadrix-Documents-Coding-Cofana-manuel-m-hlhoffs-bot";
+  const base = `/Users/x/code/m${u}ller-repo`;
+  const want = "-Users-x-code-m-ller-repo";
   // NFC input (composed ü = U+00FC)
   assert.equal(projectToHash(base.normalize("NFC")), want);
   // NFD input (decomposed ü = u + U+0308) — what macOS process.cwd() returns.

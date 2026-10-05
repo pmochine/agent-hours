@@ -1,9 +1,6 @@
 /**
- * agent-hours timing core. The legacy binary calculation remains compatible
- * with reference/claude_hours.py + reference/prototype-split.py.
- *
- * Parity is enforced by test/parity.test.mjs: same fixtures through both
- * implementations must yield identical numbers.
+ * agent-hours timing core: merged timelines and the three-state human/AI split.
+ * Regression coverage lives in test/core.test.mjs.
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -45,7 +42,7 @@ export const PROJECTS_BASE = path.join(os.homedir(), ".claude", "projects");
  * /Users/x/code/foo -> -Users-x-code-foo (Claude Code's project dir naming).
  * Two non-obvious rules, both verified against real dirs:
  *  1. Claude Code replaces EVERY non-alphanumeric character with "-", not just
- *     path separators — so "manuel-mühlhoffs-bot" -> "manuel-m-hlhoffs-bot".
+ *     path separators — so "café-bot" -> "caf--bot".
  *  2. macOS hands paths to a process in NFD form (the "ü" arrives decomposed
  *     as "u" + combining diaeresis), but Claude Code stores the dir in NFC.
  *     Without normalizing first, the decomposed "u" survives as "mu-" and the
@@ -388,35 +385,6 @@ export function detectOverlaps(sessions: NamedSession[]): boolean {
   return false;
 }
 
-export interface SplitResult {
-  totalMinutes: number;
-  humanMinutes: number;
-  aiSoloMinutes: number;
-  promptCount: number;
-}
-
-/**
- * The core USP. Total = capped inter-event time over the merged timeline of
- * ALL events. Human-active = capped inter-PROMPT time (its own cap — "waiting
- * for Claude and testing" counts as active). AI-solo = total − human.
- */
-export function computeSplit(
-  merged: SessionEvent[],
-  capMinutes: number,
-  promptCapMinutes: number
-): SplitResult {
-  const allTimes = merged.map((e) => e.ts);
-  const promptTimes = merged.filter((e) => e.kind === "prompt").map((e) => e.ts);
-  const totalMinutes = activeMinutes(allTimes, capMinutes);
-  const humanMinutes = activeMinutes(promptTimes, promptCapMinutes);
-  return {
-    totalMinutes,
-    humanMinutes: Math.min(humanMinutes, totalMinutes),
-    aiSoloMinutes: Math.max(0, totalMinutes - humanMinutes),
-    promptCount: promptTimes.length,
-  };
-}
-
 export type TimeZoneSpec = number | string;
 
 const formatterCache = new Map<string, Intl.DateTimeFormat>();
@@ -668,7 +636,7 @@ export function computeRefinedSplit(
 
 /**
  * Per-day capped minutes. Each gap is attributed to the day of its EARLIER
- * event (same convention as the Python reference's --by-day and --csv).
+ * event.
  */
 export function bucketMinutesByDay(
   timesMs: number[],

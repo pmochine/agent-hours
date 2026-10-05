@@ -40,9 +40,13 @@ agent-hours --source codex --timezone Europe/Berlin --worklog-json
 1. **"How many hours did I work?"** — run \`--json\`. Present the BAND, never a
    single number as truth: direct-interaction estimate, attention estimate
    (including evidence-weighted supervision), and inter-prompt upper estimate.
+   Map the band to the \`--json\` keys: direct interaction = \`handsOnHours\`,
+   attention = \`attentionHours\`, upper bound = \`upperBoundHours\`,
+   AI = \`aiAutonomousHours\`, total = \`totalHours\`.
    Mention total agent runtime separately.
 2. **"What did I work on?"** — run \`--worklog --csv --by-day\` (or per-hour for
-   one day) and summarize the description column in your own words, grouped
+   one day) and summarize the \`Description\` column in your own words.
+   \`--lang de\` localizes CSV headers and the total-row label. Group descriptions
    by theme. This is free — do NOT pass --summarize unless the user asks.
 3. **Invoice/billing export** — write the CSV to the requested location and
    state that browser, call, and unrelated editor time is absent. Reconcile

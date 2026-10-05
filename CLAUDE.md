@@ -1,26 +1,20 @@
 # CLAUDE.md
 
-> **What this is:** Orientation for an AI agent working in this repo.
-> **What this is NOT:** Product docs (see README.md) or a status/decision log (see PLAN.md, local-only).
-> **Update frequency:** An entry point below changes. Then update this file.
+Orientation for agents working in this public npm package and GitHub repo (`pmochine/agent-hours`). README.md is the product documentation.
 
-**Last verified:** 2026-09-18
-
-## TL;DR
-
-`agent-hours` is a public npm package and GitHub repo (pmochine/agent-hours). README.md is the product doc and entry point. PLAN.md and MARKETING.md are gitignored, local-only files with status, decisions, and client context. Do not copy their content into a tracked file.
+**Last verified:** 2026-10-05
 
 ## Where things live
 
-- **Entry point / product docs:** README.md (install, usage, methodology, roadmap).
-- **Status + decisions:** PLAN.md (gitignored). Sections 8/9 are the live status. Decisions are inline `✅ ENTSCHIEDEN` markers in context, not a separate ADR file. This fits a solo-maintainer project of this size.
-- **Core logic:** `src/core.ts` (timekeeping/split) + `src/cli.ts` (entry). Adapters per agent CLI live in `src/sources/` (one file, yields `{timestamp, kind, presence}` events).
-- **Python reference implementation:** `reference/claude_hours.py`, kept as a golden master. `test/parity.test.mjs` fails on any numeric drift between it and the TypeScript core.
-- **Agent-facing skill:** `skills/agent-hours/SKILL.md`, also synced into the Claude Code plugin (`.claude-plugin/`) by `scripts/sync-skill.mjs` on build. Edit the skill source, not a generated copy.
-- **Tests:** `npm test` (builds, then runs `node --test test/*.test.mjs`).
+- **Product docs:** README.md (install, usage, methodology, roadmap).
+- **Status pointer:** PLAN.md (gitignored, local). Its last section is the live status. PLAN.md and MARKETING.md contain private context; never copy it into tracked files.
+- **Core and entry point:** `src/core.ts` (timekeeping/split), `src/cli.ts` (CLI).
+- **Adapters:** Claude Code lives in `src/core.ts` (`findClaudeProjectDirs`, `classifyRecord`, `loadProject`) plus `collectWorklog` in `src/worklog.ts`. Codex lives in `src/sources/codex.ts` plus `collectCodexWorklog` in `src/worklog.ts`, wired in `src/cli.ts`. Events are `SessionEvent {ts, kind, presence, session?, reactionAnchor?}` inside `NamedSession[]`.
+- **Skill:** Source of truth is `SKILL_MD` in `src/install.ts`. `npm run build` regenerates `skills/agent-hours/SKILL.md`, which the plugin (`.claude-plugin/`, marketplace source `.`) ships. Never edit that file by hand.
+- **Tests:** `npm test` builds and runs `node --test test/*.test.mjs`.
 
-## Rules for this repo
+## Rules
 
-- Public repo. Use no German text, no private paths, no client names in any tracked file.
-- Do not hand-edit `dist/`. It is a gitignored build artifact. Run `npm run build` to regenerate it.
-- New agent adapters go in `src/sources/`, matching the existing `{timestamp, kind, presence}` event shape.
+- Public repo: no German text, private paths, client names, or secrets in tracked files. The two named exceptions are the German CSV header strings behind `--lang de` in `src/cli.ts` and the German trigger phrases in the skill description in `src/install.ts` (also present in the generated skill).
+- Do not hand-edit `dist/` or the generated skill. Run `npm run build`.
+- No `git push`. No `--no-verify`.

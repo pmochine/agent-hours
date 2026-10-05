@@ -7,7 +7,7 @@
   },
   "homepage": "https://github.com/pmochine/agent-hours#readme",
   "bugs": "https://github.com/pmochine/agent-hours/issues",
-  "description": "Billable hours and worklogs from local Claude Code and Codex session logs, with an evidence-based hands-on / supervised / AI-autonomous split.",
+  "description": "Billable hours and worklogs from local Claude Code and Codex session logs, with an evidence-based direct interaction / supervised / AI-autonomous split.",
   "type": "module",
   "bin": {
     "agent-hours": "dist/cli.js"

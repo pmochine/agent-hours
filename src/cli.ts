@@ -91,6 +91,7 @@ Options:
   --worklog              hourly what-was-done log (markdown)
   --worklog-json         hourly worklog as JSON + LLM prompt template
   --csv                  CSV output (semicolon-separated)
+  --lang <en|de>         CSV headers and total label (default: en)
   --json                 JSON output (always includes the split)
   --timezone <iana>      IANA zone for ranges/buckets (default: system zone)
   --tz-offset <h>        fixed-offset compatibility mode; disables DST
@@ -109,6 +110,25 @@ Methodology — three states, an estimate rather than a stopwatch:
                force 100%)
   AI-autonomous the rest of agent runtime
 Browser, call, and unrelated editor time is not present in agent logs.`;
+
+type CsvLanguage = "en" | "de";
+
+const CSV_HEADERS = {
+  en: {
+    hours: ["Date", "Duration (h)", "Duration (h:mm)"],
+    split: ["Direct interaction (h)", "Supervised (h)", "Human attention (h)", "AI autonomous (h)"],
+    worklogDay: ["Date", "Active (h)", "Direct interaction (h)", "Supervised (h)", "AI (h)", "Description"],
+    worklogHour: ["Date", "Hour", "Active (min)", "Direct interaction (min)", "Supervised (min)", "AI (min)", "Description"],
+    total: "TOTAL",
+  },
+  de: {
+    hours: ["Datum", "Dauer (h)", "Dauer (Stunden:Minuten)"],
+    split: ["Direct interaction (h)", "Supervised (h)", "Mensch gesamt (h)", "AI-solo (h)"],
+    worklogDay: ["Datum", "Aktiv (h)", "Direct interaction (h)", "Supervised (h)", "AI (h)", "Beschreibung"],
+    worklogHour: ["Datum", "Stunde", "Aktiv (min)", "Direct interaction (min)", "Supervised (min)", "AI (min)", "Beschreibung"],
+    total: "GESAMT",
+  },
+};
 
 function fail(msg: string): never {
   process.stderr.write(msg + "\n");
@@ -208,6 +228,7 @@ async function main(): Promise<void> {
         worklog: { type: "boolean", default: false },
         "worklog-json": { type: "boolean", default: false },
         csv: { type: "boolean", default: false },
+        lang: { type: "string", default: "en" },
         json: { type: "boolean", default: false },
         timezone: { type: "string" },
         "tz-offset": { type: "string" },
@@ -225,6 +246,9 @@ async function main(): Promise<void> {
   } catch (e) {
     fail(`${(e as Error).message}\n\nRun agent-hours --help for usage.`);
   }
+
+  if (args.lang !== "en" && args.lang !== "de") fail("--lang must be en or de.");
+  const lang: CsvLanguage = args.lang;
 
   if (positionals[0] === "install") {
     const target = (positionals[1] ?? "all") as "claude" | "codex" | "all";
@@ -372,7 +396,7 @@ async function main(): Promise<void> {
     if (wantCodex && projectPath) logs.push(collectCodexWorklog(projectPath, sinceMs, untilMs, timeZone));
     const worklog = mergeWorklogMaps(logs);
     if (args.csv && !args["worklog-json"]) {
-      printWorklogCsv(worklog, refined, args["by-day"], args.summarize);
+      printWorklogCsv(worklog, refined, args["by-day"], lang, args.summarize);
     } else {
       printWorklog(projectDir, worklog, refined, args["worklog-json"], args.summarize);
     }
@@ -383,7 +407,7 @@ async function main(): Promise<void> {
     return;
   }
   if (args.csv) {
-    printCsv(refined, args.split);
+    printCsv(refined, args.split, lang);
     return;
   }
 
@@ -404,8 +428,7 @@ async function main(): Promise<void> {
   for (const c of [1, 2, 3, 5, 10, 15]) {
     const h = fmtH(activeMinutes(allTimes, c));
     const hs = fmtH(activeMinutesStrict(allTimes, c));
-    let marker = c === Math.round(cap) ? "  ← standard" : "";
-    if (c === 2) marker += "  ← pure working time";
+    const marker = c === Math.round(cap) ? "  ← standard" : "";
     console.log(`  ${String(c).padStart(2)}min    ${h.padStart(6)}h          ${hs.padStart(6)}h${marker}`);
   }
   console.log();
@@ -535,10 +558,10 @@ function aggregateDays(refined: RefinedSplit): Map<string, DayStates> {
   return days;
 }
 
-function printCsv(refined: RefinedSplit, withSplit: boolean): void {
+function printCsv(refined: RefinedSplit, withSplit: boolean, lang: CsvLanguage): void {
   const days = aggregateDays(refined);
-  const header = ["Datum", "Dauer (h)", "Dauer (Stunden:Minuten)"];
-  if (withSplit) header.push("Direct interaction (h)", "Supervised (h)", "Mensch gesamt (h)", "AI-solo (h)");
+  const header = [...CSV_HEADERS[lang].hours];
+  if (withSplit) header.push(...CSV_HEADERS[lang].split);
   console.log(header.join(";"));
   for (const day of [...days.keys()].sort()) {
     const d = days.get(day)!;
@@ -594,12 +617,13 @@ function aiSummarize(buckets: SummaryBucket[]): Map<string, string> {
 
 /**
  * Worklog as CSV with rule-based descriptions — hourly by default, daily with
- * --by-day. Always ends with a GESAMT row describing the whole range.
+ * --by-day. Always ends with a total row describing the whole range.
  */
 function printWorklogCsv(
   log: Map<string, HourLog>,
   refined: RefinedSplit,
   byDay: boolean,
+  lang: CsvLanguage,
   summarize = false
 ): void {
   const keys = [...new Set([...refined.byHour.keys(), ...log.keys()])].sort();
@@ -628,7 +652,7 @@ function printWorklogCsv(
     ai.get(key) ?? describeLog(l, maxLen);
 
   if (byDay) {
-    console.log(["Datum", "Aktiv (h)", "Direct interaction (h)", "Supervised (h)", "AI (h)", "Beschreibung"].join(";"));
+    console.log(CSV_HEADERS[lang].worklogDay.join(";"));
     const days = [...new Set(keys.map((k) => k.slice(0, 10)))].sort();
     for (const day of days) {
       const dayHours = keys.filter((k) => k.startsWith(day));
@@ -651,7 +675,7 @@ function printWorklogCsv(
       );
     }
   } else {
-    console.log(["Datum", "Stunde", "Aktiv (min)", "Direct interaction (min)", "Supervised (min)", "AI (min)", "Beschreibung"].join(";"));
+    console.log(CSV_HEADERS[lang].worklogHour.join(";"));
     for (const k of keys) {
       const st = refined.byHour.get(k) ?? { total: 0, handsOn: 0, supervised: 0, ai: 0 };
       const l = log.get(k);
@@ -671,7 +695,7 @@ function printWorklogCsv(
 
   // Project-level summary row (chronological merge)
   const all = mergeLogs(keys.map((k) => log.get(k)).filter((l): l is NonNullable<typeof l> => !!l));
-  const label = byDay ? "GESAMT" : "GESAMT;";
+  const label = CSV_HEADERS[lang].total + (byDay ? "" : ";");
   console.log(
     [
       label,
