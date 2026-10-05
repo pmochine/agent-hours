@@ -8,8 +8,8 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
-import { StringDecoder } from "node:string_decoder";
-import type { NamedSession, SessionEvent } from "../core.js";
+import { forEachJsonlRecord, isLogFileBefore } from "../jsonl.js";
+import type { NamedSession, SessionEvent, TimelineLoadOptions } from "../core.js";
 
 export const CODEX_HOME = process.env["CODEX_HOME"] || path.join(os.homedir(), ".codex");
 export const CODEX_SESSIONS_BASE = path.join(CODEX_HOME, "sessions");
@@ -68,68 +68,37 @@ function isSubagentSource(payload: Record<string, unknown>): boolean {
 
 /** Read the first session_meta only; later metadata may be inherited context. */
 function readMeta(file: string): CodexSessionFile | null {
-  let fd: number;
-  try {
-    fd = fs.openSync(file, "r");
-  } catch {
-    return null;
-  }
-  try {
-    const CHUNK = 65536;
-    const MAX = 4 * 1024 * 1024;
-    let pending = "";
-    const decoder = new StringDecoder("utf8");
-    let pos = 0;
-    let rec: Record<string, unknown> | null = null;
-    while (!rec && pos < MAX) {
-      const buf = Buffer.alloc(CHUNK);
-      const n = fs.readSync(fd, buf, 0, CHUNK, pos);
-      pending += n > 0 ? decoder.write(buf.subarray(0, n)) : decoder.end();
-      pos += n;
-      const lines = pending.split("\n");
-      pending = n > 0 ? lines.pop()! : "";
-      for (const line of lines) {
-        try {
-          const parsed = JSON.parse(line);
-          if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) continue;
-          if (parsed["type"] === "session_meta") {
-            rec = parsed;
-            break;
-          }
-        } catch {
-          // Keep looking through malformed and non-object lines.
-        }
-      }
-      if (n <= 0) break;
+  let rec: Record<string, unknown> | null = null;
+  forEachJsonlRecord(file, (record) => {
+    if (record["type"] === "session_meta") {
+      rec = record;
+      return false;
     }
-    if (!rec) return null;
-    const payload = (rec["payload"] ?? {}) as Record<string, unknown>;
-    if (typeof payload["cwd"] !== "string") return null;
-    const subagent = isSubagentSource(payload);
-    const source = payload["source"];
-    const ts = typeof rec["timestamp"] === "string" ? Date.parse(rec["timestamp"] as string) : NaN;
-    const rawId = payload["id"] ?? payload["session_id"];
-    const historyBase = payload["history_base"] as Record<string, unknown> | undefined;
-    return {
-      file,
-      cwd: payload["cwd"] as string,
-      sessionId: typeof rawId === "string" ? rawId : null,
-      historyBaseEndOrdinal:
-        typeof historyBase?.["end_ordinal_exclusive"] === "number"
-          ? historyBase["end_ordinal_exclusive"] : null,
-      interactive:
-        !subagent &&
-        payload["originator"] !== "Claude Code" &&
-        (source === undefined ||
-          (typeof source === "string" && source !== "exec" && source !== "mcp")),
-      subagent,
-      startedAt: Number.isNaN(ts) ? 0 : ts,
-    };
-  } catch {
-    return null;
-  } finally {
-    fs.closeSync(fd);
-  }
+  });
+  if (!rec) return null;
+  const record = rec as Record<string, unknown>;
+  const payload = (record["payload"] ?? {}) as Record<string, unknown>;
+  if (typeof payload["cwd"] !== "string") return null;
+  const subagent = isSubagentSource(payload);
+  const source = payload["source"];
+  const ts = typeof record["timestamp"] === "string" ? Date.parse(record["timestamp"] as string) : NaN;
+  const rawId = payload["id"] ?? payload["session_id"];
+  const historyBase = payload["history_base"] as Record<string, unknown> | undefined;
+  return {
+    file,
+    cwd: payload["cwd"] as string,
+    sessionId: typeof rawId === "string" ? rawId : null,
+    historyBaseEndOrdinal:
+      typeof historyBase?.["end_ordinal_exclusive"] === "number"
+        ? historyBase["end_ordinal_exclusive"] : null,
+    interactive:
+      !subagent &&
+      payload["originator"] !== "Claude Code" &&
+      (source === undefined ||
+        (typeof source === "string" && source !== "exec" && source !== "mcp")),
+    subagent,
+    startedAt: Number.isNaN(ts) ? 0 : ts,
+  };
 }
 
 function userTextParts(payload: Record<string, unknown>): string[] {
@@ -173,34 +142,20 @@ export function codexHumanInput(record: Record<string, unknown>): { prompt: stri
   return { prompt: null, presence: false };
 }
 
-function parseEvents(meta: CodexSessionFile, sinceMs: number, untilMs: number): SessionEvent[] {
-  let raw: string;
-  try {
-    raw = fs.readFileSync(meta.file, "utf8");
-  } catch {
-    return [];
-  }
+function parseEvents(meta: CodexSessionFile, options: TimelineLoadOptions): SessionEvent[] {
+  if (isLogFileBefore(meta.file, options.pruneBeforeMs)) return [];
   const events: SessionEvent[] = [];
-  // Current subagent rollouts can contain a replay of parent history. Its
-  // original timestamps predate the child session_meta and must not count twice.
-  const effectiveSince = meta.subagent ? Math.max(sinceMs, meta.startedAt) : sinceMs;
-  for (const line of raw.split("\n")) {
-    if (!line.trim()) continue;
-    let r: Record<string, unknown>;
-    try {
-      r = JSON.parse(line);
-    } catch {
-      continue;
-    }
-    if (!r || typeof r !== "object" || Array.isArray(r)) continue;
+  // Subagents may replay parent history before their own start.
+  const effectiveSince = meta.subagent ? meta.startedAt : -Infinity;
+  forEachJsonlRecord(meta.file, (r) => {
     const tsStr = r["timestamp"];
-    if (typeof tsStr !== "string") continue;
+    if (typeof tsStr !== "string") return;
     const ts = Date.parse(tsStr);
-    if (Number.isNaN(ts) || ts < effectiveSince || ts > untilMs) continue;
+    if (Number.isNaN(ts) || ts < effectiveSince) return;
 
     const p = (r["payload"] ?? {}) as Record<string, unknown>;
     // Bookkeeping often has no following human message (69 of 246 measured cases).
-    if (r["type"] === "event_msg" && p["type"] === "thread_settings_applied") continue;
+    if (r["type"] === "event_msg" && p["type"] === "thread_settings_applied") return;
     const input = meta.interactive ? codexHumanInput(r) : { prompt: null, presence: false };
     const kind: SessionEvent["kind"] = input.prompt !== null ? "prompt" : "work";
     const item = (p["item"] ?? {}) as Record<string, unknown>;
@@ -212,7 +167,7 @@ function parseEvents(meta: CodexSessionFile, sinceMs: number, untilMs: number): 
       (meta.interactive && r["type"] === "realtime_item" &&
         p["type"] === "transcript_segment" && p["role"] === "assistant");
     events.push({ ts, kind, presence: input.presence, reactionAnchor });
-  }
+  });
   events.sort((a, b) => a.ts - b.ts);
   return events;
 }
@@ -267,8 +222,7 @@ function baseSegment(segments: CodexSessionFile[]): CodexSessionFile {
 
 /** Merge each thread's unique segments, preferring active over archived copies. */
 export function scanCodexSessions(
-  sinceMs: number,
-  untilMs: number,
+  options: TimelineLoadOptions = {},
   baseDir?: CodexSessionBase,
   projectPath?: string,
   includeDescendants = true
@@ -276,7 +230,7 @@ export function scanCodexSessions(
   const scanned: ScannedCodexSession[] = [];
   for (const segments of groupSegments(scanCodexMetadata(baseDir, projectPath, includeDescendants)).values()) {
     const meta = baseSegment(segments);
-    const events = segments.flatMap((segment) => parseEvents(segment, sinceMs, untilMs))
+    const events = segments.flatMap((segment) => parseEvents(segment, options))
       .sort((a, b) => a.ts - b.ts);
     if (!events.length) continue;
     const containingDir = baseDirs(baseDir).find((dir) => meta.file.startsWith(dir + path.sep));
@@ -297,29 +251,23 @@ function belongsToProject(cwd: string, projectPath: string, includeDescendants: 
   return actual === project || (includeDescendants && actual.startsWith(project + path.sep));
 }
 
-/** Loads Codex sessions whose cwd is the project path (or inside it). */
+/** Loads complete Codex timelines whose cwd is the project path (or inside it). */
 export function loadCodexSessions(
   projectPath: string,
-  sinceMs: number,
-  untilMs: number,
+  options: TimelineLoadOptions = {},
   baseDir?: CodexSessionBase,
   includeDescendants = true
 ): NamedSession[] {
-  return scanCodexSessions(sinceMs, untilMs, baseDir, projectPath, includeDescendants).map(
+  return scanCodexSessions(options, baseDir, projectPath, includeDescendants).map(
     (s) => s.session
   );
 }
 
-/** Same matching as loadCodexSessions, without parsing every unrelated rollout. */
+/** All matching metadata, including old bases needed to classify continuations. */
 export function findCodexSessionFiles(
   projectPath: string,
-  sinceMs: number,
-  untilMs: number,
   baseDir?: CodexSessionBase,
   includeDescendants = true
 ): CodexSessionFile[] {
-  // The caller still filters individual records to the requested time range.
-  void sinceMs;
-  void untilMs;
   return scanCodexMetadata(baseDir, projectPath, includeDescendants);
 }

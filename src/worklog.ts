@@ -4,15 +4,17 @@
  * from the JSONLs: typed prompts, edited files, commands, commits, and the
  * away_summary texts Claude Code itself wrote (free LLM summaries!).
  */
-import * as fs from "node:fs";
 import * as path from "node:path";
 import {
   hourKey,
   isHumanPromptSource,
   isMachineGeneratedText,
-  subagentJsonlFiles,
+  claudeProjectFiles,
+  claudeQuestionAnswers,
+  classifyRecord,
   type TimeZoneSpec,
 } from "./core.js";
+import { forEachJsonlRecord, isLogFileBefore } from "./jsonl.js";
 import {
   findCodexSessionFiles,
   codexHumanInput,
@@ -59,29 +61,14 @@ function isUsefulWorklogPrompt(text: string): boolean {
   return !trimmed.startsWith("<") && !trimmed.startsWith("[Request interrupted");
 }
 
-function jsonlFiles(projectDir: string): string[] {
-  let entries: fs.Dirent[];
-  try {
-    entries = fs.readdirSync(projectDir, { withFileTypes: true });
-  } catch {
-    return [];
-  }
-  const files = entries
-    .filter((e) => e.isFile() && e.name.endsWith(".jsonl"))
-    .map((e) => path.join(projectDir, e.name));
-  for (const dir of entries.filter((e) => e.isDirectory())) {
-    const subDir = path.join(projectDir, dir.name, "subagents");
-    files.push(...subagentJsonlFiles(subDir));
-  }
-  return files.sort();
-}
-
 /** Collects per-hour worklog evidence. Keys: "YYYY-MM-DD HH:00" (local). */
 export function collectWorklog(
   projectDir: string,
   sinceMs: number,
   untilMs: number,
-  timeZone: TimeZoneSpec
+  timeZone: TimeZoneSpec,
+  projectPath?: string,
+  includeDescendants = true
 ): Map<string, HourLog> {
   const hours = new Map<string, HourLog>();
   const bucket = (ts: number): HourLog => {
@@ -94,27 +81,14 @@ export function collectWorklog(
     return b;
   };
 
-  for (const file of jsonlFiles(projectDir)) {
+  for (const file of claudeProjectFiles(projectDir, projectPath, includeDescendants)) {
+    if (isLogFileBefore(file, sinceMs)) continue;
     const isSubagent = file.includes(`${path.sep}subagents${path.sep}`);
-    let raw: string;
-    try {
-      raw = fs.readFileSync(file, "utf8");
-    } catch {
-      continue;
-    }
-    for (const line of raw.split("\n")) {
-      if (!line.trim()) continue;
-      let r: Record<string, unknown>;
-      try {
-        r = JSON.parse(line);
-      } catch {
-        continue;
-      }
-      if (!r || typeof r !== "object" || Array.isArray(r)) continue;
+    forEachJsonlRecord(file, (r) => {
       const tsStr = r["timestamp"];
-      if (typeof tsStr !== "string") continue;
+      if (typeof tsStr !== "string") return;
       const ts = Date.parse(tsStr);
-      if (Number.isNaN(ts) || ts < sinceMs || ts > untilMs) continue;
+      if (Number.isNaN(ts) || ts < sinceMs || ts >= untilMs) return;
 
       const type = r["type"];
 
@@ -123,6 +97,11 @@ export function collectWorklog(
         if (type === "user" && !r["isMeta"] && !r["isCompactSummary"]) {
           const src = r["promptSource"];
           if (isHumanPromptSource(src) || src === undefined) {
+            const answers = src === undefined && classifyRecord(r).kind === "prompt" ? claudeQuestionAnswers(r) : null;
+            if (answers) {
+              const text = Object.values(answers).map((value) => typeof value === "string" ? value : JSON.stringify(value)).join("; ");
+              if (text) bucket(ts).prompts.push(excerpt(text));
+            }
             const msg = r["message"] as Record<string, unknown> | undefined;
             const c = msg?.["content"];
             let text: string | null = null;
@@ -165,7 +144,7 @@ export function collectWorklog(
       if (type === "assistant") {
         const msg = r["message"] as Record<string, unknown> | undefined;
         const c = msg?.["content"];
-        if (!Array.isArray(c)) continue;
+        if (!Array.isArray(c)) return;
         for (const item of c) {
           if (!item || typeof item !== "object") continue;
           const it = item as Record<string, unknown>;
@@ -179,7 +158,7 @@ export function collectWorklog(
           }
         }
       }
-    }
+    });
   }
   return hours;
 }
@@ -242,28 +221,15 @@ export function collectCodexWorklog(
     return b;
   };
 
-  for (const meta of findCodexSessionFiles(projectPath, sinceMs, untilMs, baseDir)) {
-    let raw: string;
-    try {
-      raw = fs.readFileSync(meta.file, "utf8");
-    } catch {
-      continue;
-    }
+  for (const meta of findCodexSessionFiles(projectPath, baseDir)) {
+    if (isLogFileBefore(meta.file, sinceMs)) continue;
     const effectiveSince = meta.subagent ? Math.max(sinceMs, meta.startedAt) : sinceMs;
     const seenCommandCalls = new Set<string>();
-    for (const line of raw.split("\n")) {
-      if (!line.trim()) continue;
-      let r: Record<string, unknown>;
-      try {
-        r = JSON.parse(line);
-      } catch {
-        continue;
-      }
-      if (!r || typeof r !== "object" || Array.isArray(r)) continue;
+    forEachJsonlRecord(meta.file, (r) => {
       const tsStr = r["timestamp"];
-      if (typeof tsStr !== "string") continue;
+      if (typeof tsStr !== "string") return;
       const ts = Date.parse(tsStr);
-      if (Number.isNaN(ts) || ts < effectiveSince || ts > untilMs) continue;
+      if (Number.isNaN(ts) || ts < effectiveSince || ts >= untilMs) return;
       const payload = (r["payload"] ?? {}) as Record<string, unknown>;
       if (meta.interactive) {
         const input = codexHumanInput(r);
@@ -292,15 +258,15 @@ export function collectCodexWorklog(
             if (typeof patchText === "string") addPatchFiles(bucket(ts), patchText);
           }
         }
-        continue;
+        return;
       }
 
-      if (r["type"] !== "event_msg" || payload["type"] !== "item_completed") continue;
+      if (r["type"] !== "event_msg" || payload["type"] !== "item_completed") return;
       const item = (payload["item"] ?? {}) as Record<string, unknown>;
       const itemType = item["type"];
       if (itemType === "CommandExecution") {
         const callId = item["id"] ?? item["call_id"];
-        if (typeof callId === "string" && seenCommandCalls.has(callId)) continue;
+        if (typeof callId === "string" && seenCommandCalls.has(callId)) return;
         const cmd = codexCommand(item);
         if (cmd) {
           addCommand(bucket(ts), cmd);
@@ -319,7 +285,7 @@ export function collectCodexWorklog(
           bucket(ts).awaySummaries.push(excerpt(content, 200));
         }
       }
-    }
+    });
   }
   return hours;
 }

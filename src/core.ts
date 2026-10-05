@@ -5,6 +5,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
+import { forEachJsonlRecord, isLogFileBefore } from "./jsonl.js";
 
 export type EventKind = "prompt" | "work";
 
@@ -23,6 +24,13 @@ export interface SessionEvent {
   session?: string;
   /** True for assistant output a later human prompt can genuinely react to. */
   reactionAnchor?: boolean;
+  /** A human enqueue typed while the agent was running. */
+  midTurn?: boolean;
+}
+
+export interface TimelineLoadOptions {
+  /** Skip event bodies in append-only files older than this cutoff. */
+  pruneBeforeMs?: number;
 }
 
 export interface NamedSession {
@@ -79,24 +87,60 @@ function canonicalPath(p: string): string {
 }
 
 function cwdFromJsonl(file: string): string | null {
-  let raw: string;
+  let cwd: string | null = null;
+  forEachJsonlRecord(file, (record) => {
+    if (typeof record["cwd"] === "string") {
+      cwd = record["cwd"];
+      return false;
+    }
+  }, { maxLines: 200 });
+  return cwd;
+}
+
+/** Match each transcript's own cwd, allowing cwd-less exact-hash history. */
+export function claudeFileMatchesProject(
+  file: string,
+  projectDir: string,
+  projectPath: string,
+  includeDescendants = true
+): boolean {
+  const project = canonicalPath(projectPath);
+  const cwd = cwdFromJsonl(file);
+  if (cwd === null) return path.basename(projectDir) === projectToHash(project);
+  const actual = canonicalPath(cwd);
+  return actual === project || (includeDescendants && actual.startsWith(project + path.sep));
+}
+
+/** Top-level sessions and their subagents share the parent's project identity. */
+export function claudeProjectFiles(
+  projectDir: string,
+  projectPath?: string,
+  includeDescendants = true
+): string[] {
+  let entries: fs.Dirent[];
   try {
-    raw = fs.readFileSync(file, "utf8");
+    entries = fs.readdirSync(projectDir, { withFileTypes: true });
   } catch {
-    return null;
+    return [];
   }
-  for (const line of raw.split("\n").slice(0, 200)) {
-    if (!line.trim()) continue;
-    try {
-      const record = JSON.parse(line);
-      if (!record || typeof record !== "object" || Array.isArray(record)) continue;
-      const cwd = record["cwd"];
-      if (typeof cwd === "string") return cwd;
-    } catch {
-      // Keep looking: one malformed record must not hide a usable cwd.
+  const matches = (file: string) => !projectPath ||
+    claudeFileMatchesProject(file, projectDir, projectPath, includeDescendants);
+  const parents = new Map<string, boolean>();
+  const files: string[] = [];
+  for (const entry of entries.filter((e) => e.isFile() && e.name.endsWith(".jsonl")).sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0)) {
+    const file = path.join(projectDir, entry.name);
+    const include = matches(file);
+    parents.set(entry.name.slice(0, -6), include);
+    if (include) files.push(file);
+  }
+  for (const entry of entries.filter((e) => e.isDirectory()).sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0)) {
+    const parent = parents.get(entry.name);
+    if (parent === false) continue;
+    for (const file of subagentJsonlFiles(path.join(projectDir, entry.name, "subagents"))) {
+      if (parent === true || matches(file)) files.push(file);
     }
   }
-  return null;
+  return files;
 }
 
 /** Best-effort readable cwd for a Claude project directory. */
@@ -139,11 +183,7 @@ export function findClaudeProjectDirs(
   }
   return names
     .map((name) => path.join(projectsBase, name))
-    .filter((dir) => {
-      const cwd = readClaudeProjectCwd(dir);
-      if (cwd === null) return path.basename(dir) === exactHash;
-      return cwd === project || (includeDescendants && cwd.startsWith(project + path.sep));
-    });
+    .filter((dir) => claudeProjectFiles(dir, project, includeDescendants).length > 0);
 }
 
 export interface Classified {
@@ -166,6 +206,19 @@ export function isMachineGeneratedText(text: string): boolean {
 /** Explicit Claude sources known to represent a person's input. */
 export function isHumanPromptSource(source: unknown): boolean {
   return source === "typed" || source === "suggestion_accepted";
+}
+
+/** Answers to Claude's question tool carry structured human answer values. */
+export function claudeQuestionAnswers(record: Record<string, unknown>): Record<string, unknown> | null {
+  const result = record["toolUseResult"];
+  if (!result || typeof result !== "object" || Array.isArray(result)) return null;
+  const r = result as Record<string, unknown>;
+  const answers = r["answers"];
+  if (!("questions" in r) || !answers || typeof answers !== "object" || Array.isArray(answers)) return null;
+  const message = record["message"] as Record<string, unknown> | undefined;
+  const content = message?.["content"];
+  return Array.isArray(content) && content.some((item) => item?.type === "tool_result")
+    ? answers as Record<string, unknown> : null;
 }
 
 /**
@@ -214,6 +267,7 @@ export function classifyRecord(record: unknown): Classified {
     // Any explicit non-typed source (system, queued, sdk, hooks, or a future
     // source) is machine-delivered. The shape fallback is legacy-only.
     if (src !== undefined) return work;
+    if (claudeQuestionAnswers(r)) return { kind: "prompt", presence: true };
     const msg = r["message"] as Record<string, unknown> | undefined;
     const c = msg?.["content"];
     if (typeof c === "string" && !isMachineGeneratedText(c)) {
@@ -242,48 +296,33 @@ export function classifyKind(record: unknown): EventKind {
 }
 
 /**
- * Reads all events of one session JSONL, filtered to [sinceMs, untilMs].
+ * Reads the complete timeline of one session JSONL, with optional file pruning.
  * With forceWork (subagent transcripts) every event counts as machine work —
  * subagent "user" messages are task prompts from the orchestrator, not humans.
  */
 export function loadSessionEvents(
   jsonlPath: string,
-  sinceMs: number,
-  untilMs: number,
+  options: TimelineLoadOptions = {},
   forceWork = false
 ): SessionEvent[] {
-  let raw: string;
-  try {
-    raw = fs.readFileSync(jsonlPath, "utf8");
-  } catch {
-    return [];
-  }
+  if (isLogFileBefore(jsonlPath, options.pruneBeforeMs)) return [];
   const events: SessionEvent[] = [];
-  for (const line of raw.split("\n")) {
-    if (!line.trim()) continue;
-    let record: unknown;
-    try {
-      record = JSON.parse(line);
-    } catch {
-      continue;
-    }
-    if (!record || typeof record !== "object" || Array.isArray(record)) continue;
-    const tsStr = (record as Record<string, unknown>)?.["timestamp"];
-    if (typeof tsStr !== "string") continue;
+  forEachJsonlRecord(jsonlPath, (record) => {
+    const tsStr = record["timestamp"];
+    if (typeof tsStr !== "string") return;
     const ts = Date.parse(tsStr);
-    if (Number.isNaN(ts)) continue;
-    if (ts < sinceMs || ts > untilMs) continue;
-    const rawRecord = record as Record<string, unknown>;
-    // Written about 3 minutes after the last record, when the person has left.
-    if (rawRecord["type"] === "system" && rawRecord["subtype"] === "away_summary") continue;
-    const reactionAnchor = rawRecord["type"] === "assistant";
+    if (Number.isNaN(ts)) return;
+    // Written after the last record, when the person has left.
+    if (record["type"] === "system" && record["subtype"] === "away_summary") return;
+    const reactionAnchor = record["type"] === "assistant";
     if (forceWork) {
       events.push({ ts, kind: "work", presence: false, reactionAnchor });
     } else {
       const c = classifyRecord(record);
-      events.push({ ts, kind: c.kind, presence: c.presence, reactionAnchor });
+      const midTurn = c.kind === "prompt" && record["type"] === "queue-operation";
+      events.push({ ts, kind: c.kind, presence: c.presence, reactionAnchor, ...(midTurn ? { midTurn: true } : {}) });
     }
-  }
+  });
   events.sort((a, b) => a.ts - b.ts);
   return events;
 }
@@ -296,26 +335,15 @@ export function loadSessionEvents(
  */
 export function loadProject(
   projectDir: string,
-  sinceMs: number,
-  untilMs: number
+  options: TimelineLoadOptions = {},
+  projectPath?: string,
+  includeDescendants = true
 ): NamedSession[] {
-  let entries: fs.Dirent[];
-  try {
-    entries = fs.readdirSync(projectDir, { withFileTypes: true });
-  } catch {
-    return [];
-  }
   const sessions: NamedSession[] = [];
-  for (const f of entries.filter((e) => e.isFile() && e.name.endsWith(".jsonl")).map((e) => e.name).sort()) {
-    const events = loadSessionEvents(path.join(projectDir, f), sinceMs, untilMs);
-    if (events.length > 0) sessions.push({ name: f, events });
-  }
-  for (const dir of entries.filter((e) => e.isDirectory()).map((e) => e.name).sort()) {
-    const subDir = path.join(projectDir, dir, "subagents");
-    for (const file of subagentJsonlFiles(subDir)) {
-      const events = loadSessionEvents(file, sinceMs, untilMs, true);
-      if (events.length > 0) sessions.push({ name: path.relative(projectDir, file), events });
-    }
+  for (const file of claudeProjectFiles(projectDir, projectPath, includeDescendants)) {
+    const forceWork = file.includes(`${path.sep}subagents${path.sep}`);
+    const events = loadSessionEvents(file, options, forceWork);
+    if (events.length > 0) sessions.push({ name: path.relative(projectDir, file), events });
   }
   return sessions;
 }
@@ -339,27 +367,21 @@ export function subagentJsonlFiles(dir: string): string[] {
   return files.sort();
 }
 
-/**
- * Common activity-log estimate: sum inter-event gaps, with each gap capped at
- * capMinutes ("cap bonus" — a longer pause still contributes capMinutes).
- */
-export function activeMinutes(timesMs: number[], capMinutes: number): number {
-  if (timesMs.length < 2) return 0;
+/** Capped segments clipped to a start-inclusive, end-exclusive range. */
+export function cappedMinutesInRange(
+  timesMs: number[],
+  capMinutes: number,
+  rangeStartMs = -Infinity,
+  rangeEndMs = Infinity,
+  strict = false
+): number {
   let total = 0;
   for (let i = 1; i < timesMs.length; i++) {
-    const gap = (timesMs[i] - timesMs[i - 1]) / 60000;
-    total += Math.min(gap, capMinutes);
-  }
-  return total;
-}
-
-/** Strict variant: gaps > cap count 0 (no cap bonus). Honest lower bound. */
-export function activeMinutesStrict(timesMs: number[], capMinutes: number): number {
-  if (timesMs.length < 2) return 0;
-  let total = 0;
-  for (let i = 1; i < timesMs.length; i++) {
-    const gap = (timesMs[i] - timesMs[i - 1]) / 60000;
-    if (gap <= capMinutes) total += gap;
+    const gap = timesMs[i] - timesMs[i - 1];
+    if (strict && gap > capMinutes * 60000) continue;
+    const start = Math.max(timesMs[i - 1], rangeStartMs);
+    const end = Math.min(timesMs[i - 1] + Math.min(gap, capMinutes * 60000), rangeEndMs);
+    total += Math.max(0, end - start) / 60000;
   }
   return total;
 }
@@ -451,7 +473,10 @@ export function dayKey(tsMs: number, zone: TimeZoneSpec): string {
 /** Local-hour key (YYYY-MM-DD HH:00), supporting daylight-saving changes. */
 export function hourKey(tsMs: number, zone: TimeZoneSpec): string {
   const p = localParts(tsMs, zone);
-  return `${p.year}-${p.month}-${p.day} ${p.hour}:00`;
+  const label = `${p.year}-${p.month}-${p.day} ${p.hour}:00`;
+  const previous = localParts(tsMs - 3600_000, zone);
+  const previousLabel = `${previous.year}-${previous.month}-${previous.day} ${previous.hour}:00`;
+  return previousLabel === label ? label + " (repeated)" : label;
 }
 
 export function dateTimeKey(tsMs: number, zone: TimeZoneSpec): string {
@@ -464,6 +489,7 @@ export interface HourStates {
   handsOn: number;
   supervised: number;
   ai: number;
+  upper: number;
 }
 
 export interface RefinedSplit {
@@ -474,7 +500,7 @@ export interface RefinedSplit {
   supervisedMinutes: number;
   /** handsOn + supervised — an evidence-based human-attention estimate. */
   attentionMinutes: number;
-  /** Old inter-prompt heuristic — everything between prompts counts. */
+  /** Full attention budget, allocated and clipped per credited gap. */
   upperBoundMinutes: number;
   /** total − attention. */
   aiAutonomousMinutes: number;
@@ -485,6 +511,8 @@ export interface RefinedSplit {
 export interface RefinedOptions {
   capMinutes: number;
   promptCapMinutes: number;
+  rangeStartMs?: number;
+  rangeEndMs?: number;
   /** Preferred DST-aware zone. tzOffsetHours remains for API compatibility. */
   timeZone?: TimeZoneSpec;
   tzOffsetHours?: number;
@@ -498,8 +526,8 @@ export interface RefinedOptions {
  * Three-state model (replaces the binary inter-prompt heuristic, which counts
  * Claude-working time inside prompt windows as fully human):
  *
- * Per prompt-to-prompt window, capped at promptCapMinutes (same cap semantics
- * as the old heuristic, so the old number stays a true upper bound):
+ * Per prompt-to-prompt window, the attention budget is limited by the credited
+ * gap capacity and promptCapMinutes:
  *
  * 1. direct interaction — the credited reaction tail between the latest
  *    assistant output in the same session and the next prompt. If a person
@@ -512,7 +540,7 @@ export interface RefinedOptions {
  *    mid-turn, external file edit) forces 100 %.
  * 3. AI autonomous — total minus the two above.
  *
- * Invariant: handsOn + supervised <= upperBound (old heuristic) <= total.
+ * Invariant, per credited gap: handsOn + supervised <= upperBound <= total.
  * A fast reaction proves presence at the END of a window, not throughout —
  * capping supervision at the prompt-cap window encodes exactly that.
  */
@@ -523,156 +551,134 @@ export function computeRefinedSplit(
   const WATCH_FULL = opts.watchFullMinutes ?? 0.5;
   const WATCH_HALF = opts.watchHalfMinutes ?? 5;
   const timeZone = opts.timeZone ?? opts.tzOffsetHours ?? 0;
-  const n = merged.length;
+  const rangeStart = opts.rangeStartMs ?? -Infinity;
+  const rangeEnd = opts.rangeEndMs ?? Infinity;
+  const gaps = merged.slice(1).map((event, i) => ({
+    start: merged[i].ts,
+    credit: Math.min((event.ts - merged[i].ts) / 60000, opts.capMinutes),
+    handsOn: 0,
+    supervised: 0,
+    upper: 0,
+  }));
 
-  const promptIdx: number[] = [];
-  for (let i = 0; i < n; i++) if (merged[i].kind === "prompt") promptIdx.push(i);
+  // Track same-session evidence before each prompt in one forward pass.
+  type Evidence = { prompt: number; anchor: number; presence: number };
+  const emptyEvidence = (): Evidence => ({ prompt: -1, anchor: -1, presence: -1 });
+  const sessions = new Map<string | undefined, Evidence>();
+  const global = emptyEvidence();
+  let previousPrompt = -1;
+  let promptCount = 0;
+  for (let i = 0; i < merged.length; i++) {
+    const event = merged[i];
+    const session = sessions.get(event.session) ?? emptyEvidence();
+    sessions.set(event.session, session);
+    const evidence = event.session ? session : global;
+    if (event.kind === "prompt") {
+      if (event.ts >= rangeStart && event.ts < rangeEnd) promptCount++;
+      if (previousPrompt >= 0) {
+        const anchor = evidence.anchor > evidence.prompt ? evidence.anchor : evidence.prompt;
+        const reactionMin = anchor >= 0 ? (event.ts - merged[anchor].ts) / 60000 : Infinity;
+        let creditedWindow = 0;
+        for (let j = previousPrompt; j < i; j++) creditedWindow += gaps[j].credit;
+        const budget = Math.min(creditedWindow, opts.promptCapMinutes);
+        const tail = Math.min(Number.isFinite(reactionMin) ? reactionMin : 0, budget);
+        const proof = event.midTurn === true || evidence.presence > previousPrompt;
+        const weight = proof || reactionMin <= WATCH_FULL ? 1 : reactionMin <= WATCH_HALF ? 0.5 : 0;
 
-  // Pass 1: totals per hour over the full event timeline.
-  let total = 0;
-  const byHour = new Map<string, HourStates>();
-  const hourOf = (tsMs: number) => hourKey(tsMs, timeZone);
-  const bucket = (key: string): HourStates => {
-    let b = byHour.get(key);
-    if (!b) {
-      b = { total: 0, handsOn: 0, supervised: 0, ai: 0 };
-      byHour.set(key, b);
+        let tailLeft = tail;
+        for (let j = i - 1; j >= previousPrompt && tailLeft > 0; j--) {
+          const take = Math.min(gaps[j].credit, tailLeft);
+          gaps[j].handsOn = take;
+          tailLeft -= take;
+        }
+        // Full supervision gives the upper amount; actual supervision uses
+        // the same proportional capacities with the evidence weight.
+        let upperLeft = budget - tail;
+        let supLeft = upperLeft * weight;
+        let remainingCapacity = 0;
+        for (let j = previousPrompt; j < i; j++) remainingCapacity += gaps[j].credit - gaps[j].handsOn;
+        for (let j = previousPrompt; j < i; j++) {
+          const gap = gaps[j];
+          const capacity = gap.credit - gap.handsOn;
+          const upper = remainingCapacity > 0 ? Math.min(capacity, upperLeft * capacity / remainingCapacity) : 0;
+          const supervised = remainingCapacity > 0 ? Math.min(capacity, supLeft * capacity / remainingCapacity) : 0;
+          gap.supervised = supervised;
+          gap.upper = gap.handsOn + upper;
+          upperLeft -= upper;
+          supLeft -= supervised;
+          remainingCapacity -= capacity;
+        }
+      }
+      previousPrompt = i;
+      session.prompt = global.prompt = i;
     }
-    return b;
-  };
-  for (let i = 1; i < n; i++) {
-    const capped = Math.min((merged[i].ts - merged[i - 1].ts) / 60000, opts.capMinutes);
-    total += capped;
-    bucket(hourOf(merged[i - 1].ts)).total += capped;
+    if (event.reactionAnchor === true) session.anchor = global.anchor = i;
+    if (event.presence) session.presence = global.presence = i;
   }
 
-  // Pass 2: human states per prompt-to-prompt segment.
+  // Allocation is independent of the range. Clip uniformly spread gap states,
+  // then divide the segments at UTC quarter-hours (including DST folds).
+  const byHour = new Map<string, HourStates>();
+  const hourCache = new Map<number, string>();
+  const SLOT = 15 * 60000;
+  let total = 0;
   let handsOn = 0;
   let supervised = 0;
-  for (let k = 1; k < promptIdx.length; k++) {
-    const p1 = promptIdx[k - 1];
-    const p2 = promptIdx[k];
-
-    // A prompt is a reaction to output in its own session. Busy subagents or
-    // another terminal must not manufacture a near-zero reaction time.
-    const promptSession = merged[p2].session;
-    let previousSessionPrompt = -1;
-    for (let j = p2 - 1; j >= 0; j--) {
-      if (merged[j].kind === "prompt" && (!promptSession || merged[j].session === promptSession)) {
-        previousSessionPrompt = j;
-        break;
+  let upperBound = 0;
+  let ai = 0;
+  for (const gap of gaps) {
+    const end = Math.min(gap.start + gap.credit * 60000, rangeEnd);
+    let start = Math.max(gap.start, rangeStart);
+    while (start < end) {
+      const slot = Math.floor(start / SLOT) * SLOT;
+      const partEnd = Math.min(end, slot + SLOT);
+      let key = hourCache.get(slot);
+      if (!key) {
+        key = hourKey(slot, timeZone);
+        hourCache.set(slot, key);
       }
-    }
-    let reactionAnchor = -1;
-    for (let j = p2 - 1; j > previousSessionPrompt; j--) {
-      if (
-        merged[j].reactionAnchor === true &&
-        (!promptSession || merged[j].session === promptSession)
-      ) {
-        reactionAnchor = j;
-        break;
-      }
-    }
-    if (reactionAnchor < 0) reactionAnchor = previousSessionPrompt;
-    const reactionMin =
-      reactionAnchor >= 0 ? (merged[p2].ts - merged[reactionAnchor].ts) / 60000 : Infinity;
-
-    // Attention may only be allocated from time that Pass 1 actually credited.
-    // This keeps all states non-negative even when promptCapMinutes > capMinutes.
-    const gaps: Array<{ key: string; credit: number; remaining: number }> = [];
-    let creditedWindow = 0;
-    for (let i = p1 + 1; i <= p2; i++) {
-      const credit = Math.min((merged[i].ts - merged[i - 1].ts) / 60000, opts.capMinutes);
-      creditedWindow += credit;
-      gaps.push({ key: hourOf(merged[i - 1].ts), credit, remaining: credit });
-    }
-    const attentionBudget = Math.min(creditedWindow, opts.promptCapMinutes);
-    const creditedReaction = Number.isFinite(reactionMin) ? reactionMin : 0;
-    const tail = Math.min(creditedReaction, attentionBudget);
-    const agentPart = attentionBudget - tail;
-
-    let proof = false;
-    for (let j = p2 - 1; j > p1; j--) {
-      if (
-        merged[j].presence &&
-        (!promptSession || merged[j].session === promptSession)
-      ) {
-        proof = true;
-        break;
-      }
-    }
-    let w = 0;
-    if (proof || reactionMin <= WATCH_FULL) w = 1;
-    else if (reactionMin <= WATCH_HALF) w = 0.5;
-    const sup = agentPart * w;
-
-    handsOn += tail;
-    supervised += sup;
-
-    // Allocate attention out of the exact gap credits that make up total.
-    // This guarantees every hourly bucket and the global result obey the same
-    // non-negative state invariant.
-    let tailLeft = tail;
-    for (let i = gaps.length - 1; i >= 0 && tailLeft > 0; i--) {
-      const take = Math.min(gaps[i].remaining, tailLeft);
-      gaps[i].remaining -= take;
-      tailLeft -= take;
-      bucket(gaps[i].key).handsOn += take;
-    }
-    let supLeft = sup;
-    let remainingCapacity = gaps.reduce((sum, gap) => sum + gap.remaining, 0);
-    for (const gap of gaps) {
-      if (supLeft <= 0 || remainingCapacity <= 0) break;
-      const capacity = gap.remaining;
-      const share = (supLeft * capacity) / remainingCapacity;
-      const take = Math.min(capacity, share);
-      gap.remaining -= take;
-      supLeft -= take;
-      remainingCapacity -= capacity;
-      bucket(gap.key).supervised += take;
+      const bucket = byHour.get(key) ?? { total: 0, handsOn: 0, supervised: 0, ai: 0, upper: 0 };
+      const minutes = (partEnd - start) / 60000;
+      const fraction = minutes / gap.credit;
+      const direct = gap.handsOn * fraction;
+      const watched = gap.supervised * fraction;
+      const upper = gap.upper * fraction;
+      const autonomous = Math.max(0, minutes - direct - watched);
+      bucket.total += minutes;
+      bucket.handsOn += direct;
+      bucket.supervised += watched;
+      bucket.upper += upper;
+      bucket.ai += autonomous;
+      byHour.set(key, bucket);
+      total += minutes;
+      handsOn += direct;
+      supervised += watched;
+      upperBound += upper;
+      ai += autonomous;
+      start = partEnd;
     }
   }
-  for (const b of byHour.values()) {
-    b.ai = Math.max(0, b.total - b.handsOn - b.supervised);
-  }
-
-  const promptTimes = promptIdx.map((i) => merged[i].ts);
-  const upperBound = Math.min(activeMinutes(promptTimes, opts.promptCapMinutes), total);
-  const attention = Math.min(handsOn + supervised, total);
-
   return {
     totalMinutes: total,
     handsOnMinutes: handsOn,
     supervisedMinutes: supervised,
-    attentionMinutes: attention,
+    attentionMinutes: handsOn + supervised,
     upperBoundMinutes: upperBound,
-    aiAutonomousMinutes: Math.max(0, total - attention),
-    promptCount: promptIdx.length,
+    aiAutonomousMinutes: ai,
+    promptCount,
     byHour,
   };
 }
 
-/**
- * Per-day capped minutes. Each gap is attributed to the day of its EARLIER
- * event.
- */
-export function bucketMinutesByDay(
+export function countByDay(
   timesMs: number[],
-  capMinutes: number,
-  timeZone: TimeZoneSpec
+  timeZone: TimeZoneSpec,
+  rangeStartMs = -Infinity,
+  rangeEndMs = Infinity
 ): Map<string, number> {
   const days = new Map<string, number>();
-  for (let i = 1; i < timesMs.length; i++) {
-    const gap = Math.min((timesMs[i] - timesMs[i - 1]) / 60000, capMinutes);
-    const day = dayKey(timesMs[i - 1], timeZone);
-    days.set(day, (days.get(day) ?? 0) + gap);
-  }
-  return days;
-}
-
-export function countByDay(timesMs: number[], timeZone: TimeZoneSpec): Map<string, number> {
-  const days = new Map<string, number>();
   for (const t of timesMs) {
+    if (t < rangeStartMs || t >= rangeEndMs) continue;
     const day = dayKey(t, timeZone);
     days.set(day, (days.get(day) ?? 0) + 1);
   }

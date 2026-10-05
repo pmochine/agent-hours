@@ -41,7 +41,7 @@ Existing tools don't answer this:
 
 ## Features
 
-- **Three-state human/AI split** — direct interaction (capped reaction-time estimate), supervised (evidence-weighted), and AI-autonomous; the older inter-prompt heuristic is shown as an upper estimate, so you get a transparent band rather than fake precision.
+- **Three-state human/AI split** — direct interaction (capped reaction-time estimate), supervised (evidence-weighted), and AI-autonomous; the full attention budget for each prompt window is shown as an upper estimate, so you get a transparent band rather than fake precision.
 - **Multi-agent, one timeline** — Claude Code and Codex CLI sessions merge into a single timeline. Parallel agents never double-count wall-clock time; an agent launched *by* another agent counts as AI runtime, not as you.
 - **Hourly worklog** — what was done per hour: your prompts, edited files (incl. subagents), commands, commit messages, and the away-summaries the agent itself wrote.
 - **Descriptions with or without AI** — rule-based summaries are the default (deterministic, free, reproducible). `--summarize` optionally refines them via `claude -p` — the only feature that costs API money, strictly opt-in. It is also the only feature that sends data off the machine: prompt excerpts, file paths and commit messages go to Claude via `claude -p`. Or pipe `--worklog-json` into the AI chat you're already paying for.

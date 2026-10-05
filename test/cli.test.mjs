@@ -167,3 +167,159 @@ test("CLI CSV protects formula-leading descriptions without changing numeric cel
     }
   });
 });
+
+function withCodexRecords(records, callback) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ah-cli-interval-"));
+  try {
+    const sessions = path.join(dir, "sessions");
+    fs.mkdirSync(sessions);
+    const meta = { type: "session_meta", timestamp: records[0].timestamp, payload: { id: "interval-session", cwd: "/tmp/interval-project", source: "cli" } };
+    fs.writeFileSync(path.join(sessions, "rollout.jsonl"), [meta, ...records].map((r) => JSON.stringify(r)).join("\n"));
+    callback({ CODEX_HOME: dir });
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+}
+
+test("CLI clips JSON, cap overview, session tables, all-projects and worklog evidence to the real range", () => {
+  withCodexRecords([
+    { type: "response_item", timestamp: "2026-06-01T09:59:00Z", payload: { type: "message", role: "user", content: "Before range." } },
+    { type: "response_item", timestamp: "2026-06-01T10:04:00Z", payload: { type: "message", role: "user", content: "In range." } },
+  ], (env) => {
+    const args = ["--project", "/tmp/interval-project", "--source", "codex", "--timezone", "UTC", "--since", "2026-06-01 10:00", "--until", "2026-06-01 10:05"];
+    const result = run([...args, "--json"], env);
+    assert.equal(result.status, 0, result.stderr);
+    const json = JSON.parse(result.stdout);
+    assert.equal(json.totalHours, 0.07);
+    assert.equal(json.attentionHours, 0.07);
+    assert.equal(json.strictTotalHours, 0.07);
+    assert.equal(json.prompts, 1);
+    assert.equal(json.events, 1);
+    assert.equal(json.capRange["5"].totalHours, 0.07);
+    const overview = run([...args, "--by-session", "--by-day"], env);
+    assert.equal(overview.status, 0, overview.stderr);
+    assert.match(overview.stdout, /1min\s+0\.00h\s+0\.00h/);
+    assert.match(overview.stdout, /5min\s+0\.07h\s+0\.07h/);
+    assert.match(overview.stdout, /0\.07h active/);
+    assert.match(overview.stdout, /2026-06-01 \|\s+0\.07h \|\s+1 events/);
+    const all = run([...args, "--all-projects", "--json"], env);
+    assert.equal(all.status, 0, all.stderr);
+    assert.equal(JSON.parse(all.stdout).totalHours, json.totalHours);
+    assert.equal(JSON.parse(all.stdout).projects[0].events, 1);
+    const worklog = run([...args, "--worklog-json"], env);
+    assert.equal(worklog.status, 0, worklog.stderr);
+    assert.deepEqual(JSON.parse(worklog.stdout).hours.flatMap((h) => h.prompts), ["In range."]);
+  });
+});
+
+test("CLI inclusive date ranges join at midnight and daily outputs aggregate split hours", () => {
+  withCodexRecords([
+    { type: "response_item", timestamp: "2026-06-01T23:58:00Z", payload: { type: "message", role: "user", content: "Begin." } },
+    { type: "response_item", timestamp: "2026-06-02T00:03:00Z", payload: { type: "message", role: "user", content: "Finish." } },
+  ], (env) => {
+    const args = ["--project", "/tmp/interval-project", "--source", "codex", "--timezone", "UTC", "--since", "2026-06-01"];
+    const json = (extra) => {
+      const result = run([...args, ...extra, "--json"], env);
+      assert.equal(result.status, 0, result.stderr);
+      return JSON.parse(result.stdout);
+    };
+    const whole = json(["--until", "2026-06-02"]);
+    const first = json(["--until", "2026-06-01"]);
+    const second = json(["--since", "2026-06-02", "--until", "2026-06-02"]);
+    assert.deepEqual(whole.byDay.map((d) => d.totalHours), [0.03, 0.05]);
+    assert.equal(first.totalHours + second.totalHours, whole.totalHours);
+    assert.equal(first.attentionHours + second.attentionHours, whole.attentionHours);
+    const daily = run([...args, "--until", "2026-06-02", "--by-day"], env);
+    assert.equal(daily.status, 0, daily.stderr);
+    assert.match(daily.stdout, /2026-06-01 \|\s+0\.03h/);
+    assert.match(daily.stdout, /2026-06-02 \|\s+0\.05h/);
+  });
+});
+
+test("CLI hourly worklog CSV uses one decimal for minutes and daily CSV keeps two for hours", () => {
+  for (const [flags, start, digits] of [[[], 2, 1], [["--by-day"], 1, 2]]) {
+    const result = run([...SUMMARY_ARGS, ...flags]);
+    assert.equal(result.status, 0, result.stderr);
+    const rows = result.stdout.trimEnd().split("\n").slice(1);
+    for (const row of rows) {
+      const numeric = row.split(";").slice(start, start + 4);
+      assert.equal(numeric.length, 4);
+      for (const cell of numeric) assert.match(cell, new RegExp(`^\\d+\\.\\d{${digits}}$`));
+    }
+  }
+});
+
+test("CLI prints one unreadable-log warning at exit", () => {
+  withCodexRecords([
+    { type: "response_item", timestamp: "2026-06-01T00:00:00Z", payload: { type: "message", role: "user", content: "Review." } },
+  ], (env) => {
+    const script = path.join(env.CODEX_HOME, "unreadable.cjs");
+    const file = path.join(env.CODEX_HOME, "sessions", "rollout.jsonl");
+    // Simulate denied access even when the test runner can bypass file modes.
+    fs.writeFileSync(script, `
+      const fs = require('node:fs');
+      const open = fs.openSync;
+      fs.openSync = (file, ...args) => {
+        if (file === ${JSON.stringify(file)}) throw new Error('Unreadable fixture');
+        return open(file, ...args);
+      };
+      require('node:module').syncBuiltinESMExports();
+    `);
+    const result = run(["--all-projects", "--source", "codex", "--json"], {
+      ...env, NODE_OPTIONS: `--require ${JSON.stringify(script)}`,
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stderr, "warning: 1 log files could not be read\n");
+    assert.deepEqual(JSON.parse(result.stdout).projects, []);
+  });
+});
+
+test("CLI adjacent date ranges stay additive across a multi-day prompt gap", () => {
+  withCodexRecords([
+    { type: "response_item", timestamp: "2026-09-15T23:57:00Z", payload: { type: "message", role: "user", content: "Begin." } },
+    { type: "response_item", timestamp: "2026-09-18T00:00:00Z", payload: { type: "message", role: "user", content: "Continue." } },
+  ], (env) => {
+    const json = (since, until) => {
+      const result = run(["--project", "/tmp/interval-project", "--source", "codex", "--timezone", "UTC", "--cap", "12", "--prompt-cap", "12", "--since", since, "--until", until, "--json"], env);
+      assert.equal(result.status, 0, result.stderr);
+      return JSON.parse(result.stdout);
+    };
+    const whole = json("2026-09-01", "2026-09-30");
+    const first = json("2026-09-01", "2026-09-15");
+    const second = json("2026-09-16", "2026-09-30");
+    for (const key of ["totalHours", "handsOnHours", "supervisedHours", "attentionHours", "upperBoundHours", "aiAutonomousHours"]) {
+      assert.ok(Math.abs(first[key] + second[key] - whole[key]) < 1e-9, key);
+    }
+    assert.equal(whole.totalHours, 0.2);
+    assert.equal(first.totalHours, 0.05);
+    assert.equal(second.totalHours, 0.15);
+  });
+});
+
+test("CLI known projects return zero hours when every timeline file is pruned", () => {
+  withCodexRecords([
+    { type: "response_item", timestamp: "2026-06-01T00:00:00Z", payload: { type: "message", role: "user", content: "Earlier work." } },
+  ], (env) => {
+    const file = path.join(env.CODEX_HOME, "sessions", "rollout.jsonl");
+    fs.utimesSync(file, new Date("2026-06-01T00:00:00Z"), new Date("2026-06-01T00:00:00Z"));
+    const result = run(["--project", "/tmp/interval-project", "--source", "codex", "--since", "2026-09-01", "--json"], env);
+    assert.equal(result.status, 0, result.stderr);
+    const json = JSON.parse(result.stdout);
+    assert.equal(json.totalHours, 0);
+    assert.equal(json.attentionHours, 0);
+    assert.equal(json.aiAutonomousHours, 0);
+    assert.equal(json.prompts, 0);
+  });
+});
+
+test("CLI lists only overlapping pauses and clips their idle and cap-bonus totals", () => {
+  withCodexRecords(["09:00", "09:20", "11:00", "12:00"].map((time) => ({
+    type: "response_item", timestamp: `2026-06-01T${time}:00Z`,
+    payload: { type: "message", role: "user", content: "Continue." },
+  })), (env) => {
+    const result = run(["--project", "/tmp/interval-project", "--source", "codex", "--timezone", "UTC", "--since", "2026-06-01T10:00:00Z", "--until", "2026-06-01T10:29:59.999Z", "--pauses"], env);
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /1 total, 0\.50h idle/);
+    assert.match(result.stdout, /Cap-bonus effect: 0min/);
+    assert.match(result.stdout, /Top 1 longest pauses/);
+    assert.match(result.stdout, /2026-06-01 09:20 – 2026-06-01 11:00/);
+  });
+});

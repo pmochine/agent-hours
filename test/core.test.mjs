@@ -3,8 +3,8 @@ import assert from "node:assert/strict";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
-  activeMinutes,
-  activeMinutesStrict,
+  cappedMinutesInRange,
+  countByDay,
   classifyKind,
   classifyRecord,
   computeRefinedSplit,
@@ -30,6 +30,7 @@ import {
   scanCodexSessions,
 } from "../dist/sources/codex.js";
 import { runInstall, SKILL_MD, checkRetention, setRetention } from "../dist/install.js";
+import { forEachJsonlRecord, unreadableFileCount } from "../dist/jsonl.js";
 import fs from "node:fs";
 import os from "node:os";
 
@@ -47,14 +48,14 @@ function minutes(...mins) {
   return mins.map((m) => base + m * 60000);
 }
 
-test("activeMinutes caps each gap (cap bonus)", () => {
-  assert.equal(activeMinutes(minutes(0, 5, 30), 10), 15);
-  assert.equal(activeMinutes(minutes(0), 10), 0);
-  assert.equal(activeMinutes([], 10), 0);
+test("cappedMinutesInRange caps each gap (cap bonus)", () => {
+  assert.equal(cappedMinutesInRange(minutes(0, 5, 30), 10), 15);
+  assert.equal(cappedMinutesInRange(minutes(0), 10), 0);
+  assert.equal(cappedMinutesInRange([], 10), 0);
 });
 
-test("activeMinutesStrict drops gaps above the cap entirely", () => {
-  assert.equal(activeMinutesStrict(minutes(0, 5, 30), 10), 5);
+test("cappedMinutesInRange strict drops gaps above the cap entirely", () => {
+  assert.equal(cappedMinutesInRange(minutes(0, 5, 30), 10, -Infinity, Infinity, true), 5);
 });
 
 test("findPauses returns gaps >= min, longest first", () => {
@@ -142,22 +143,22 @@ test("classify: compact summaries, sidechains, edited-file attachments", () => {
 });
 
 test("legacy fixtures: merged timeline avoids double counting parallel sessions", () => {
-  const sessions = loadProject(LEGACY, SINCE, UNTIL);
+  const sessions = loadProject(LEGACY);
   assert.equal(sessions.length, 2);
   assert.equal(detectOverlaps(sessions), true);
 
   const merged = mergeEvents(sessions);
-  assert.equal(activeMinutes(merged.map((e) => e.ts), 10), 16);
+  assert.equal(cappedMinutesInRange(merged.map((e) => e.ts), 10), 16);
 
   const sum = sessions.reduce(
-    (acc, s) => acc + activeMinutes(s.events.map((e) => e.ts), 10),
+    (acc, s) => acc + cappedMinutesInRange(s.events.map((e) => e.ts), 10),
     0
   );
   assert.equal(sum, 18);
 });
 
 test("legacy fixtures: refined split preserves frozen totals and upper bound", () => {
-  const merged = mergeEvents(loadProject(LEGACY, SINCE, UNTIL));
+  const merged = mergeEvents(loadProject(LEGACY));
   const split = computeRefinedSplit(merged, { capMinutes: 10, promptCapMinutes: 10 });
   assert.equal(split.totalMinutes, 16);
   assert.equal(split.promptCount, 2);
@@ -165,7 +166,7 @@ test("legacy fixtures: refined split preserves frozen totals and upper bound", (
 });
 
 test("legacy fixtures: refined three-state split", () => {
-  const merged = mergeEvents(loadProject(LEGACY, SINCE, UNTIL));
+  const merged = mergeEvents(loadProject(LEGACY));
   const r = computeRefinedSplit(merged, { capMinutes: 10, promptCapMinutes: 10, tzOffsetHours: 0 });
   // 25-min reaction before the second prompt => nobody watched => no supervision
   assert.equal(r.totalMinutes, 16);
@@ -178,7 +179,7 @@ test("legacy fixtures: refined three-state split", () => {
 });
 
 test("modern fixtures: subagent transcripts load as machine work", () => {
-  const sessions = loadProject(MODERN, SINCE, UNTIL);
+  const sessions = loadProject(MODERN);
   assert.equal(sessions.length, 2); // session-c + sess-1/subagents/agent-001
   const sub = sessions.find((s) => s.name.includes("subagents"));
   assert.ok(sub);
@@ -192,14 +193,14 @@ test("modern fixtures: subagent transcripts load as machine work", () => {
 });
 
 test("modern fixtures: refined split rewards watch evidence", () => {
-  const merged = mergeEvents(loadProject(MODERN, SINCE, UNTIL));
+  const merged = mergeEvents(loadProject(MODERN));
   const r = computeRefinedSplit(merged, { capMinutes: 10, promptCapMinutes: 10, tzOffsetHours: 0 });
   assert.equal(r.totalMinutes, 10);
   assert.equal(r.handsOnMinutes, 4);
   // Same-session reaction avoids treating the parallel subagent as proof of a
-  // 30-second response; the later external edit remains real presence proof.
-  assert.equal(r.supervisedMinutes, 5.5);
-  assert.equal(r.aiAutonomousMinutes, 0.5);
+  // 30-second response; queued typing and the external edit prove presence.
+  assert.equal(r.supervisedMinutes, 6);
+  assert.equal(r.aiAutonomousMinutes, 0);
 });
 
 test("refined split ignores background-session noise for reaction evidence", () => {
@@ -295,7 +296,7 @@ test("modern fixtures: rule-based description prefers commits + away summary", (
 
 test("codex adapter: cwd matching, exec vs interactive, tag filtering", () => {
   const CODEX = path.join(FIXTURES, "codex-sessions");
-  const sessions = loadCodexSessions("/tmp/proj", SINCE, UNTIL, CODEX);
+  const sessions = loadCodexSessions("/tmp/proj", {}, CODEX);
   // other-project session excluded by cwd
   assert.equal(sessions.length, 2);
   assert.ok(sessions.every((s) => s.name.startsWith("codex:")));
@@ -313,10 +314,10 @@ test("current Codex logs: subagents, multipart prompts, archives, and deduplicat
     path.join(CODEX_CURRENT, "sessions"),
     path.join(CODEX_CURRENT, "archived_sessions"),
   ];
-  const scanned = scanCodexSessions(SINCE, UNTIL, bases);
+  const scanned = scanCodexSessions({}, bases);
   assert.deepEqual(scanned.map((s) => s.sessionId).sort(), ["archived-only", "current-main", "current-sub"]);
 
-  const sessions = loadCodexSessions("/tmp/proj-current", SINCE, UNTIL, bases);
+  const sessions = loadCodexSessions("/tmp/proj-current", {}, bases);
   assert.equal(sessions.length, 3);
   assert.equal(sessions.flatMap((s) => s.events).filter((e) => e.kind === "prompt").length, 2);
   const sub = scanned.find((s) => s.sessionId === "current-sub");
@@ -328,7 +329,7 @@ test("current Codex logs: subagents, multipart prompts, archives, and deduplicat
 
 test("Codex source classification keeps legacy humans and rejects MCP automation", () => {
   const dir = path.join(FIXTURES, "codex-source-kinds");
-  const scanned = scanCodexSessions(SINCE, UNTIL, dir);
+  const scanned = scanCodexSessions({}, dir);
   const legacy = scanned.find((s) => s.sessionId === "missing-source");
   const mcp = scanned.find((s) => s.sessionId === "mcp-source");
   assert.ok(legacy?.interactive);
@@ -361,11 +362,11 @@ test("Codex project matching normalizes NFC and NFD paths", () => {
 });
 
 test("Codex continuations merge into one thread and archived segments count once", () => {
-  const files = findCodexSessionFiles("/tmp/proj-x", SINCE, UNTIL, COUNTING_CODEX);
+  const files = findCodexSessionFiles("/tmp/proj-x", COUNTING_CODEX);
   assert.equal(files.length, 2);
   assert.ok(files.every((meta) => meta.file.includes(`${path.sep}sessions${path.sep}`)));
   assert.deepEqual(files.map((meta) => meta.historyBaseEndOrdinal).sort(), [4, null]);
-  const sessions = loadCodexSessions("/tmp/proj-x", SINCE, UNTIL, COUNTING_CODEX);
+  const sessions = loadCodexSessions("/tmp/proj-x", {}, COUNTING_CODEX);
   assert.equal(sessions.length, 1);
   assert.equal(sessions[0].name, "codex:rollout-z-base.jsonl");
   const events = mergeEvents(sessions);
@@ -380,10 +381,14 @@ test("Codex continuations merge into one thread and archived segments count once
   assert.equal(split.attentionMinutes, 8.25);
   const log = mergeLogs([...collectCodexWorklog("/tmp/proj-x", SINCE, UNTIL, "UTC", COUNTING_CODEX).values()]);
   assert.deepEqual(log.prompts, ["Improve the layout.", "Add layout tests."]);
-  const late = loadCodexSessions("/tmp/proj-x", Date.parse("2026-06-03T10:07:00Z"), UNTIL, COUNTING_CODEX);
+  const late = loadCodexSessions("/tmp/proj-x", { pruneBeforeMs: Date.parse("2026-06-03T10:07:00Z") }, COUNTING_CODEX);
   assert.equal(late.length, 1);
   assert.equal(late[0].name, sessions[0].name);
-  assert.equal(late[0].events.filter((e) => e.kind === "prompt").length, 1);
+  // Pruning is per file: both complete segments remain available as context.
+  assert.equal(late[0].events.filter((e) => e.kind === "prompt").length, 2);
+  assert.equal(computeRefinedSplit(mergeEvents(late), {
+    capMinutes: 10, promptCapMinutes: 10, rangeStartMs: Date.parse("2026-06-03T10:07:00Z"),
+  }).promptCount, 1);
 });
 
 test("Codex continuation classification inherits the base segment metadata", () => {
@@ -399,9 +404,9 @@ test("Codex continuation classification inherits the base segment metadata", () 
       }
       fs.writeFileSync(path.join(dir, name), lines.join("\n") + "\n");
     }
-    const files = findCodexSessionFiles("/tmp/proj-x", SINCE, UNTIL, dir);
+    const files = findCodexSessionFiles("/tmp/proj-x", dir);
     assert.ok(files.every((meta) => meta.interactive && !meta.subagent));
-    const sessions = loadCodexSessions("/tmp/proj-x", SINCE, UNTIL, dir);
+    const sessions = loadCodexSessions("/tmp/proj-x", {}, dir);
     assert.equal(sessions[0].events.filter((e) => e.kind === "prompt").length, 2);
     const log = mergeLogs([...collectCodexWorklog("/tmp/proj-x", SINCE, UNTIL, "UTC", dir).values()]);
     assert.equal(log.prompts.length, 2);
@@ -412,9 +417,9 @@ test("Codex continuation classification inherits the base segment metadata", () 
 
 test("Claude away summaries add no time after departure and remain worklog evidence", () => {
   const dir = path.join(COUNTING, "claude-passive");
-  const events = loadSessionEvents(path.join(dir, "session.jsonl"), SINCE, UNTIL);
+  const events = loadSessionEvents(path.join(dir, "session.jsonl"));
   assert.deepEqual(events.map((e) => e.ts), ["00:00", "02:00", "25:00", "25:00"].map((t) => Date.parse(`2026-06-03T10:${t}Z`)));
-  assert.equal(activeMinutes(events.map((e) => e.ts), 10), 12);
+  assert.equal(cappedMinutesInRange(events.map((e) => e.ts), 10), 12);
   assert.equal(readClaudeProjectCwd(dir), "/tmp/proj-passive");
   const log = mergeLogs([...collectWorklog(dir, SINCE, UNTIL, "UTC").values()]);
   assert.deepEqual(log.prompts, ["Check the layout."]);
@@ -422,11 +427,11 @@ test("Claude away summaries add no time after departure and remain worklog evide
 });
 
 test("Codex thread settings add no time during a pause; other event types remain", () => {
-  const sessions = loadCodexSessions("/tmp/proj-passive", SINCE, UNTIL, COUNTING_CODEX);
+  const sessions = loadCodexSessions("/tmp/proj-passive", {}, COUNTING_CODEX);
   const events = mergeEvents(sessions);
   assert.equal(events.length, 5); // session_meta, prompt, two answers, other_bookkeeping
   assert.ok(events.every((e) => e.ts !== Date.parse("2026-06-03T10:05:00Z")));
-  assert.equal(activeMinutes(events.map((e) => e.ts), 10), 12);
+  assert.equal(cappedMinutesInRange(events.map((e) => e.ts), 10), 12);
   const log = mergeLogs([...collectCodexWorklog("/tmp/proj-passive", SINCE, UNTIL, "UTC", COUNTING_CODEX).values()]);
   assert.deepEqual(log.prompts, ["Check the layout."]);
 });
@@ -435,7 +440,7 @@ test("nested Claude workflow agents count as machine work and supply edited file
   const dir = path.join(COUNTING, "claude-workflow");
   const subDir = path.join(dir, "session", "subagents");
   assert.deepEqual(subagentJsonlFiles(subDir).map((file) => path.relative(subDir, file)), ["workflows/wf_x/agent-x.jsonl"]);
-  const sessions = loadProject(dir, SINCE, UNTIL);
+  const sessions = loadProject(dir);
   assert.equal(sessions.length, 2);
   const sub = sessions.find((session) => session.name.includes("workflows/wf_x"));
   assert.ok(sub);
@@ -450,7 +455,7 @@ test("nested Claude workflow agents count as machine work and supply edited file
 });
 
 test("Codex speech, question replies, writing edits, and delegation agree with the worklog", () => {
-  const sessions = loadCodexSessions("/tmp/proj-voice", SINCE, UNTIL, COUNTING_CODEX);
+  const sessions = loadCodexSessions("/tmp/proj-voice", {}, COUNTING_CODEX);
   const events = sessions[0].events;
   const at = (time) => events.find((event) => event.ts === Date.parse(`2026-06-03T10:${time}Z`));
   assert.equal(at("01:00").kind, "prompt");
@@ -476,7 +481,7 @@ test("Codex speech, question replies, writing edits, and delegation agree with t
 
 test("Codex plugin, exec, and subagent sessions keep all human-shaped input machine work", () => {
   for (const name of ["plugin", "exec-voice", "subagent-voice"]) {
-    const scanned = scanCodexSessions(SINCE, UNTIL, COUNTING_CODEX, `/tmp/proj-${name}`);
+    const scanned = scanCodexSessions({}, COUNTING_CODEX, `/tmp/proj-${name}`);
     assert.equal(scanned.length, 1);
     assert.equal(scanned[0].interactive, false);
     assert.ok(scanned[0].session.events.every((event) => event.kind === "work" && !event.presence));
@@ -561,10 +566,13 @@ test("retention: check + set with backup, never lowers, refuses bad JSON", () =>
   }
 });
 
-test("since/until filter trims events", () => {
-  const sessions = loadProject(LEGACY, parseDate("2026-06-01 10:04"), UNTIL);
+test("timeline loaders preserve context and the split filters prompt counts", () => {
+  const sessions = loadProject(LEGACY, { pruneBeforeMs: parseDate("2026-06-01 10:04") });
   const merged = mergeEvents(sessions);
-  assert.equal(merged.length, 3); // 10:05, 10:30, 10:31
+  assert.equal(merged.length, 7);
+  assert.equal(computeRefinedSplit(merged, {
+    capMinutes: 10, promptCapMinutes: 10, rangeStartMs: parseDate("2026-06-01 10:04"),
+  }).promptCount, 1);
 });
 
 test("parseDate handles the three accepted formats", () => {
@@ -595,7 +603,7 @@ test("IANA buckets reflect both sides of daylight-saving transitions", () => {
   assert.equal(hourKey(Date.parse("2026-03-29T00:30:00Z"), "Europe/Berlin"), "2026-03-29 01:00");
   assert.equal(hourKey(Date.parse("2026-03-29T01:30:00Z"), "Europe/Berlin"), "2026-03-29 03:00");
   assert.equal(hourKey(Date.parse("2026-10-25T00:30:00Z"), "Europe/Berlin"), "2026-10-25 02:00");
-  assert.equal(hourKey(Date.parse("2026-10-25T01:30:00Z"), "Europe/Berlin"), "2026-10-25 02:00");
+  assert.equal(hourKey(Date.parse("2026-10-25T01:30:00Z"), "Europe/Berlin"), "2026-10-25 02:00 (repeated)");
 });
 
 test("projectToHash matches Claude Code's directory naming", () => {
@@ -641,4 +649,246 @@ test("Claude descendant-project discovery confirms cwd and excludes hash-prefix 
   } finally {
     fs.rmSync(base, { recursive: true, force: true });
   }
+});
+
+function near(actual, expected) {
+  assert.ok(Math.abs(actual - expected) < 1e-9, `${actual} != ${expected}`);
+}
+
+function assertHourInvariants(split) {
+  let total = 0;
+  let upper = 0;
+  for (const bucket of split.byHour.values()) {
+    assert.ok(bucket.total <= 60 + 1e-9);
+    near(bucket.total, bucket.handsOn + bucket.supervised + bucket.ai);
+    assert.ok(bucket.handsOn + bucket.supervised <= bucket.upper + 1e-9);
+    assert.ok(bucket.upper <= bucket.total + 1e-9);
+    total += bucket.total;
+    upper += bucket.upper;
+  }
+  near(total, split.totalMinutes);
+  near(upper, split.upperBoundMinutes);
+}
+
+test("credited segments clip at range and hour boundaries", () => {
+  const events = ["2026-06-01T09:59:00Z", "2026-06-01T10:04:00Z"].map((ts) => ({
+    ts: Date.parse(ts), kind: "work", presence: false,
+  }));
+  const split = computeRefinedSplit(events, {
+    capMinutes: 10, promptCapMinutes: 10, timeZone: "UTC",
+    rangeStartMs: Date.parse("2026-06-01T10:00:00Z"),
+    rangeEndMs: Date.parse("2026-06-01T10:05:00Z"),
+  });
+  assert.equal(split.totalMinutes, 4);
+  assert.equal(split.byHour.get("2026-06-01 10:00").total, 4);
+  assertHourInvariants(split);
+  assert.equal(cappedMinutesInRange(events.map((e) => e.ts), 2, events[0].ts + 60000, events[1].ts), 1);
+  assert.equal(cappedMinutesInRange(events.map((e) => e.ts), 2, events[0].ts + 60000, events[1].ts, true), 0);
+});
+
+test("midnight segments give two minutes to the first day and three to the next", () => {
+  const events = ["2026-06-01T23:58:00Z", "2026-06-02T00:03:00Z"].map((ts) => ({
+    ts: Date.parse(ts), kind: "work", presence: false,
+  }));
+  const split = computeRefinedSplit(events, { capMinutes: 10, promptCapMinutes: 10, timeZone: "UTC" });
+  assert.equal(split.byHour.get("2026-06-01 23:00").total, 2);
+  assert.equal(split.byHour.get("2026-06-02 00:00").total, 3);
+  assertHourInvariants(split);
+});
+
+test("range clipping is additive for every state, upper budget, prompts and hour buckets", () => {
+  const event = (minute, kind, extra = {}) => ({ ts: minutes(minute)[0], kind, presence: kind === "prompt", ...extra });
+  const merged = mergeEvents([
+    { name: "main", events: [event(0, "prompt"), event(2, "work", { reactionAnchor: true }), event(8, "prompt", { midTurn: true }), event(13, "work", { reactionAnchor: true }), event(17, "prompt"), event(90, "work"), event(94, "prompt")] },
+    { name: "parallel", events: [event(3, "work"), event(10, "work", { presence: true }), event(55, "work"), event(92, "work", { reactionAnchor: true })] },
+  ]);
+  for (const [capMinutes, promptCapMinutes] of [[10, 10], [1, 10], [10, 3]]) {
+    const split = (a, b) => computeRefinedSplit(merged, {
+      capMinutes, promptCapMinutes, timeZone: "UTC", rangeStartMs: minutes(a)[0], rangeEndMs: minutes(b)[0],
+    });
+    for (const boundary of [8, 14, 60]) {
+      const left = split(1, boundary), right = split(boundary, 95), whole = split(1, 95);
+      for (const key of ["totalMinutes", "handsOnMinutes", "supervisedMinutes", "attentionMinutes", "aiAutonomousMinutes", "upperBoundMinutes", "promptCount"]) {
+        near(left[key] + right[key], whole[key]);
+      }
+      for (const [hour, bucket] of whole.byHour) {
+        for (const state of ["total", "handsOn", "supervised", "ai", "upper"]) {
+          near((left.byHour.get(hour)?.[state] ?? 0) + (right.byHour.get(hour)?.[state] ?? 0), bucket[state]);
+        }
+      }
+      for (const result of [left, right, whole]) assertHourInvariants(result);
+    }
+  }
+  assert.equal([...countByDay(minutes(0, 8, 17), "UTC", minutes(8)[0], minutes(17)[0]).values()][0], 1);
+});
+
+test("DST fold has separate ordinary and repeated hour buckets in worklogs too", () => {
+  const start = Date.parse("2026-10-25T00:00:00Z");
+  const events = Array.from({ length: 24 }, (_, i) => ({ ts: start + i * 5 * 60000, kind: "work", presence: false }));
+  events.push({ ts: start + 119 * 60000, kind: "work", presence: false });
+  const split = computeRefinedSplit(events, { capMinutes: 10, promptCapMinutes: 10, timeZone: "Europe/Berlin" });
+  assert.deepEqual([...split.byHour.keys()].sort(), ["2026-10-25 02:00", "2026-10-25 02:00 (repeated)"]);
+  assert.equal(split.byHour.get("2026-10-25 02:00").total, 60);
+  assert.equal(split.byHour.get("2026-10-25 02:00 (repeated)").total, 59);
+  assertHourInvariants(split);
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ah-fold-"));
+  try {
+    fs.writeFileSync(path.join(dir, "session.jsonl"), [30, 90].map((minute) => JSON.stringify({
+      type: "user", timestamp: new Date(start + minute * 60000).toISOString(), message: { content: "Review." },
+    })).join("\n"));
+    assert.deepEqual([...collectWorklog(dir, SINCE, UNTIL, "Europe/Berlin").keys()].sort(), [...split.byHour.keys()].sort());
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("streaming JSONL preserves split UTF-8 and final lines, skips invalid records and stops early", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ah-jsonl-"));
+  try {
+    const file = path.join(dir, "records.jsonl");
+    // The first byte of this two-byte character is byte 6, at the chunk border.
+    const first = { x: "\u00e9" }, last = { final: true };
+    fs.writeFileSync(file, JSON.stringify(first) + "\nnull\n{invalid\n\n42\n[]\n" + JSON.stringify(last));
+    const records = [];
+    forEachJsonlRecord(file, (r) => { records.push(r); }, { chunkSize: 7 });
+    assert.deepEqual(records, [first, last]);
+    const early = [];
+    forEachJsonlRecord(file, (r) => { early.push(r); return false; }, { chunkSize: 7 });
+    assert.deepEqual(early, [first]);
+    const limited = [];
+    forEachJsonlRecord(file, (r) => { limited.push(r); }, { chunkSize: 7, maxLines: 3 });
+    assert.deepEqual(limited, [first]);
+    const before = unreadableFileCount;
+    forEachJsonlRecord(path.join(dir, "missing.jsonl"), () => assert.fail("missing file yielded a record"));
+    assert.equal(unreadableFileCount, before + 1);
+    assert.throws(() => forEachJsonlRecord(file, () => {}, { chunkSize: 0 }), /chunkSize/);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("mtime pruning skips old Claude parents, subagents and Codex rollouts", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ah-mtime-"));
+  try {
+    const since = Date.parse("2026-06-01T00:00:00Z");
+    const timestamp = "2026-06-02T00:00:00Z";
+    const parent = path.join(dir, "session.jsonl");
+    const sub = path.join(dir, "session", "subagents", "agent.jsonl");
+    fs.mkdirSync(path.dirname(sub), { recursive: true });
+    for (const file of [parent, sub]) {
+      fs.writeFileSync(file, JSON.stringify({ type: "user", timestamp, message: { content: "Review." } }));
+      fs.utimesSync(file, new Date(since - 1), new Date(since - 1));
+    }
+    assert.deepEqual(loadProject(dir, { pruneBeforeMs: since }), []);
+    assert.equal(collectWorklog(dir, since, UNTIL, "UTC").size, 0);
+    assert.equal(loadProject(dir).length, 2);
+    const rollout = path.join(dir, "rollout.jsonl");
+    fs.writeFileSync(rollout, [
+      { type: "session_meta", timestamp, payload: { cwd: "/tmp/project", source: "cli" } },
+      { type: "response_item", timestamp, payload: { type: "message", role: "user", content: "Review." } },
+    ].map((r) => JSON.stringify(r)).join("\n"));
+    fs.utimesSync(rollout, new Date(since - 1), new Date(since - 1));
+    assert.deepEqual(loadCodexSessions("/tmp/project", { pruneBeforeMs: since }, dir), []);
+    assert.equal(collectCodexWorklog("/tmp/project", since, UNTIL, "UTC", dir).size, 0);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("hash collisions match each cwd and attach subagents to their own parent", () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "ah-collision-"));
+  const projects = ["/tmp/project-a", "/tmp/project/a"];
+  const dir = path.join(base, projectToHash(projects[0]));
+  try {
+    assert.equal(projectToHash(projects[0]), projectToHash(projects[1]));
+    fs.mkdirSync(dir);
+    for (const [i, cwd] of projects.entries()) {
+      const record = { type: "user", cwd, timestamp: "2026-06-01T10:00:00Z", message: { content: `Prompt ${i}` } };
+      fs.writeFileSync(path.join(dir, `${i}.jsonl`), JSON.stringify(record));
+      const subdir = path.join(dir, String(i), "subagents", "workflows");
+      fs.mkdirSync(subdir, { recursive: true });
+      // Contradictory child cwd must not override an existing parent's identity.
+      fs.writeFileSync(path.join(subdir, "agent.jsonl"), JSON.stringify({ ...record, cwd: projects[1 - i] }));
+    }
+    fs.writeFileSync(path.join(dir, "legacy.jsonl"), JSON.stringify({ type: "assistant", timestamp: "2026-06-01T10:00:00Z" }));
+    const orphan = path.join(dir, "orphan", "subagents");
+    fs.mkdirSync(orphan, { recursive: true });
+    fs.writeFileSync(path.join(orphan, "agent.jsonl"), JSON.stringify({ type: "assistant", cwd: projects[1], timestamp: "2026-06-01T10:00:00Z" }));
+    for (const [i, project] of projects.entries()) {
+      assert.deepEqual(findClaudeProjectDirs(project, base), [dir]);
+      const sessions = loadProject(dir, {}, project);
+      assert.ok(sessions.some((s) => s.name === `${i}.jsonl`));
+      assert.ok(!sessions.some((s) => s.name === `${1 - i}.jsonl`));
+      assert.ok(sessions.some((s) => s.name === `${i}/subagents/workflows/agent.jsonl`));
+      assert.ok(sessions.some((s) => s.name === "legacy.jsonl"));
+      assert.equal(sessions.some((s) => s.name === "orphan/subagents/agent.jsonl"), i === 1);
+      const log = mergeLogs([...collectWorklog(dir, SINCE, UNTIL, "UTC", project).values()]);
+      assert.deepEqual(log.prompts, [`Prompt ${i}`]);
+    }
+  } finally { fs.rmSync(base, { recursive: true, force: true }); }
+});
+
+test("queued human typing at the ending prompt proves supervised presence", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ah-queue-"));
+  try {
+    const file = path.join(dir, "session.jsonl");
+    fs.writeFileSync(file, [
+      { type: "user", timestamp: new Date(minutes(0)[0]).toISOString(), message: { content: "Start." } },
+      { type: "assistant", timestamp: new Date(minutes(1)[0]).toISOString() },
+      { type: "queue-operation", operation: "enqueue", timestamp: new Date(minutes(8)[0]).toISOString(), content: "Next." },
+    ].map((r) => JSON.stringify(r)).join("\n"));
+    const merged = mergeEvents(loadProject(dir));
+    assert.equal(merged.at(-1).midTurn, true);
+    const split = computeRefinedSplit(merged, { capMinutes: 10, promptCapMinutes: 10 });
+    assert.equal(split.supervisedMinutes, 1);
+    assertHourInvariants(split);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("Claude question answers are prompts, preserve worklog excerpts and credit reaction tails", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ah-question-"));
+  try {
+    const answer = {
+      type: "user", timestamp: new Date(minutes(4)[0]).toISOString(),
+      message: { content: [{ type: "tool_result", tool_use_id: "question-1", content: "Answered." }] },
+      toolUseResult: { questions: [{ question: "Which color?" }], answers: { "Which color?": "Blue" } },
+    };
+    assert.deepEqual(classifyRecord(answer), { kind: "prompt", presence: true });
+    assert.equal(classifyKind({ ...answer, isSidechain: true }), "work");
+    assert.equal(classifyKind({ ...answer, promptSource: "system" }), "work");
+    assert.equal(classifyKind({ ...answer, toolUseResult: { answers: { choice: "Blue" } } }), "work");
+    fs.writeFileSync(path.join(dir, "session.jsonl"), [
+      // The initiating prompt is context outside the measured range.
+      { type: "user", timestamp: new Date(minutes(-1)[0]).toISOString(), message: { content: "Change the color." } },
+      { type: "assistant", timestamp: new Date(minutes(0)[0]).toISOString(), message: { content: [{ type: "tool_use", id: "question-1", name: "AskUserQuestion", input: {} }] } },
+      answer,
+    ].map((r) => JSON.stringify(r)).join("\n"));
+    const split = computeRefinedSplit(mergeEvents(loadProject(dir)), {
+      capMinutes: 10, promptCapMinutes: 10, rangeStartMs: minutes(0)[0], rangeEndMs: minutes(5)[0],
+    });
+    assert.equal(split.promptCount, 1);
+    assert.ok(split.handsOnMinutes > 0);
+    near(split.handsOnMinutes, 4);
+    assertHourInvariants(split);
+    const log = mergeLogs([...collectWorklog(dir, minutes(0)[0], minutes(5)[0], "UTC").values()]);
+    assert.deepEqual(log.prompts, ["Blue"]);
+    assert.equal(loadSessionEvents(path.join(dir, "session.jsonl"), {}, true).at(-1).kind, "work");
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("Codex pruning keeps old base metadata to classify a fresh continuation", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ah-base-mtime-"));
+  try {
+    const cutoff = Date.parse("2026-09-19T00:00:00Z");
+    const base = path.join(dir, "base.jsonl");
+    fs.writeFileSync(base, [
+      { type: "session_meta", timestamp: "2026-09-01T00:00:00Z", payload: { id: "thread-1", cwd: "/tmp/project", source: "cli" } },
+      { type: "response_item", timestamp: "2026-09-01T00:01:00Z", payload: { type: "message", role: "user", content: "Old input." } },
+    ].map((r) => JSON.stringify(r)).join("\n"));
+    fs.utimesSync(base, new Date(cutoff - 1), new Date(cutoff - 1));
+    fs.writeFileSync(path.join(dir, "continuation.jsonl"), [
+      { type: "session_meta", timestamp: "2026-09-20T00:00:00Z", payload: { id: "thread-1", cwd: "/tmp/project", source: "exec", history_base: { end_ordinal_exclusive: 2 } } },
+      { type: "response_item", timestamp: "2026-09-20T00:01:00Z", payload: { type: "message", role: "user", content: "Continue." } },
+    ].map((r) => JSON.stringify(r)).join("\n"));
+    const sessions = loadCodexSessions("/tmp/project", { pruneBeforeMs: cutoff }, dir);
+    assert.equal(sessions.length, 1);
+    assert.equal(sessions[0].name, "codex:base.jsonl");
+    assert.equal(sessions[0].events.filter((event) => event.kind === "prompt").length, 1);
+    assert.ok(sessions[0].events.every((event) => event.ts >= cutoff));
+    assert.deepEqual(mergeLogs([...collectCodexWorklog("/tmp/project", cutoff, UNTIL, "UTC", dir).values()]).prompts, ["Continue."]);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });

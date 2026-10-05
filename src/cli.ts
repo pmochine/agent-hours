@@ -14,9 +14,7 @@ import * as path from "node:path";
 import * as os from "node:os";
 import {
   PROJECTS_BASE,
-  activeMinutes,
-  activeMinutesStrict,
-  bucketMinutesByDay,
+  cappedMinutesInRange,
   computeRefinedSplit,
   countByDay,
   dateTimeKey,
@@ -33,7 +31,9 @@ import {
   type RefinedSplit,
   type SessionEvent,
   type TimeZoneSpec,
+  type TimelineLoadOptions,
 } from "./core.js";
+import { unreadableFileCount } from "./jsonl.js";
 import {
   WORKLOG_LLM_TEMPLATE,
   collectCodexWorklog,
@@ -49,6 +49,7 @@ import {
   CODEX_ARCHIVED_SESSIONS_BASE,
   CODEX_SESSIONS_BASE,
   canonicalProjectPath,
+  findCodexSessionFiles,
   loadCodexSessions,
   scanCodexSessions,
 } from "./sources/codex.js";
@@ -306,19 +307,30 @@ async function main(): Promise<void> {
     fail(`Invalid time zone: ${String(timeZone)}`);
   }
 
-  let sinceMs = 0;
-  let untilMs = Date.parse("2100-01-01T00:00:00Z");
+  let sinceMs = -Infinity;
+  let untilMs = Infinity;
   try {
     if (args.since) sinceMs = parseDate(args.since, timeZone);
     if (args.until) {
-      untilMs =
-        args.until.includes(" ") || args.until.includes("T")
-          ? parseDate(args.until, timeZone)
-          : parseDate(args.until + " 23:59:59", timeZone) + 999;
+      if (args.until.includes(" ") || args.until.includes("T")) {
+        untilMs = parseDate(args.until, timeZone) + 1;
+      } else {
+        // Inclusive calendar dates end at the next local midnight, including DST.
+        parseDate(args.until, timeZone);
+        const nextDate = new Date(Date.parse(args.until + "T00:00:00Z") + 24 * 3600_000).toISOString().slice(0, 10);
+        untilMs = parseDate(nextDate, timeZone);
+      }
     }
   } catch (e) {
     fail((e as Error).message);
   }
+
+  // Load complete files so previous prompts, reaction anchors and future
+  // events survive long pauses. Pruning is exact unless a prompt window starts
+  // more than 24 hours before --since in a pruned file; then only that window's
+  // proportional supervised share can differ.
+  const loadOptions: TimelineLoadOptions = args.since ? { pruneBeforeMs: sinceMs - 24 * 3600_000 } : {};
+  const range = { rangeStartMs: sinceMs, rangeEndMs: untilMs };
 
   const source = String(args.source).toLowerCase();
   if (!["auto", "claude", "codex"].includes(source)) {
@@ -328,7 +340,7 @@ async function main(): Promise<void> {
   const wantCodex = source === "auto" || source === "codex";
 
   if (args["all-projects"]) {
-    runAllProjects(sinceMs, untilMs, cap, promptCap, timeZone, source, args.split, args.json);
+    runAllProjects(sinceMs, untilMs, loadOptions, cap, promptCap, timeZone, source, args.split, args.json);
     return;
   }
 
@@ -347,7 +359,7 @@ async function main(): Promise<void> {
   let claudeCount = 0;
   if (wantClaude) {
     for (const dir of claudeProjectDirs) {
-      const loaded = loadProject(dir, sinceMs, untilMs);
+      const loaded = loadProject(dir, loadOptions, projectPath ?? undefined);
       sessions.push(
         ...(claudeProjectDirs.length > 1
           ? loaded.map((session) => ({
@@ -364,10 +376,13 @@ async function main(): Promise<void> {
     projectPath &&
     (fs.existsSync(CODEX_SESSIONS_BASE) || fs.existsSync(CODEX_ARCHIVED_SESSIONS_BASE))
   ) {
-    sessions.push(...loadCodexSessions(projectPath, sinceMs, untilMs));
+    sessions.push(...loadCodexSessions(projectPath, loadOptions));
   }
   const codexCount = sessions.length - claudeCount;
-  if (sessions.length === 0) {
+  // A known project can have an empty clipped range after all files are pruned.
+  const hasHistory = claudeProjectDirs.length > 0 ||
+    (wantCodex && projectPath && sessions.length === 0 && findCodexSessionFiles(projectPath).length > 0);
+  if (sessions.length === 0 && !hasHistory) {
     fail(
       `ERROR: no sessions found.\n` +
         (wantClaude ? `  Claude logs checked: ${projectDir}\n` : "") +
@@ -384,14 +399,16 @@ async function main(): Promise<void> {
     capMinutes: cap,
     promptCapMinutes: promptCap,
     timeZone,
+    ...range,
   });
   const allTimes = merged.map((e) => e.ts);
+  const inRange = merged.filter((e) => e.ts >= sinceMs && e.ts < untilMs);
 
   if (args["worklog"] || args["worklog-json"]) {
     const logs: Map<string, HourLog>[] = [];
     if (wantClaude) {
       for (const dir of claudeProjectDirs) {
-        logs.push(collectWorklog(dir, sinceMs, untilMs, timeZone));
+        logs.push(collectWorklog(dir, sinceMs, untilMs, timeZone, projectPath ?? undefined));
       }
     }
     if (wantCodex && projectPath) logs.push(collectCodexWorklog(projectPath, sinceMs, untilMs, timeZone));
@@ -404,7 +421,7 @@ async function main(): Promise<void> {
     return;
   }
   if (args.json) {
-    printJson(projectDir, args, sessions, merged, refined, cap, promptCap, timeZone, overlapping);
+    printJson(projectDir, args, sessions, merged, refined, cap, promptCap, timeZone, overlapping, sinceMs, untilMs);
     return;
   }
   if (args.csv) {
@@ -422,13 +439,13 @@ async function main(): Promise<void> {
   if (claudeProjectDirs.length > 1) {
     console.log(`Claude project directories matched (root + descendants): ${claudeProjectDirs.length}`);
   }
-  console.log(`Total events: ${merged.length.toLocaleString("en-US")}`);
+  console.log(`Total events: ${inRange.length.toLocaleString("en-US")}`);
   console.log();
   console.log("Activity at different idle caps:");
   console.log(`  ${"Cap".padEnd(8)} ${"with cap bonus".padEnd(16)} ${"strict (pause>cap=0)".padEnd(22)}`);
   for (const c of [1, 2, 3, 5, 10, 15]) {
-    const h = fmtH(activeMinutes(allTimes, c));
-    const hs = fmtH(activeMinutesStrict(allTimes, c));
+    const h = fmtH(cappedMinutesInRange(allTimes, c, sinceMs, untilMs));
+    const hs = fmtH(cappedMinutesInRange(allTimes, c, sinceMs, untilMs, true));
     const marker = c === Math.round(cap) ? "  ← standard" : "";
     console.log(`  ${String(c).padStart(2)}min    ${h.padStart(6)}h          ${hs.padStart(6)}h${marker}`);
   }
@@ -458,6 +475,7 @@ async function main(): Promise<void> {
         capMinutes: c,
         promptCapMinutes: c,
         timeZone,
+        ...range,
       });
       console.log(
         `    cap ${String(c).padStart(2)}min: total ${fmtH(s.totalMinutes).padStart(6)}h | attention ${fmtH(s.attentionMinutes).padStart(6)}h | AI ${fmtH(s.aiAutonomousMinutes).padStart(6)}h`
@@ -466,11 +484,13 @@ async function main(): Promise<void> {
     console.log();
   }
 
-  const realPauses = findPauses(allTimes, cap);
+  const realPauses = findPauses(allTimes, cap).filter((pause) => pause.startMs < untilMs && pause.endMs > sinceMs);
   if (realPauses.length > 0 && (args.pauses || !args.split)) {
     const n = Math.min(topPauses, realPauses.length);
-    const idleTotal = realPauses.reduce((acc, p) => acc + p.minutes, 0);
-    const capBonus = realPauses.length * cap;
+    const idleTotal = realPauses.reduce((acc, p) => acc +
+      (Math.min(p.endMs, untilMs) - Math.max(p.startMs, sinceMs)) / 60000, 0);
+    const capBonus = realPauses.reduce((acc, p) => acc +
+      cappedMinutesInRange([p.startMs, p.endMs], cap, sinceMs, untilMs), 0);
     console.log(`Pauses > ${cap}min cap (${realPauses.length} total, ${fmtH(idleTotal)}h idle):`);
     console.log(`  Cap-bonus effect: ${capBonus.toFixed(0)}min (${fmtH(capBonus)}h) still counted as work by the standard method.`);
     console.log();
@@ -499,13 +519,13 @@ async function main(): Promise<void> {
     console.log(`Per session (cap ${cap}min):`);
     for (const s of sessions) {
       const times = s.events.map((e) => e.ts);
-      const a = fmtH(activeMinutes(times, cap));
+      const a = fmtH(cappedMinutesInRange(times, cap, sinceMs, untilMs));
       const f = dateTimeKey(times[0], timeZone);
       const l = dateTimeKey(times[times.length - 1], timeZone);
       console.log(`  ${s.name}`);
       console.log(`    ${f} – ${l} | ${String(times.length).padStart(4)} events | ${a.padStart(6)}h active`);
     }
-    const sumH = sessions.reduce((acc, s) => acc + activeMinutes(s.events.map((e) => e.ts), cap), 0);
+    const sumH = sessions.reduce((acc, s) => acc + cappedMinutesInRange(s.events.map((e) => e.ts), cap, sinceMs, untilMs), 0);
     console.log();
     console.log(`  Sum of individual sessions (double-counts overlap): ${fmtH(sumH)}h`);
     console.log(`  Merged timeline (real active time):                 ${fmtH(refined.totalMinutes)}h`);
@@ -524,12 +544,12 @@ async function main(): Promise<void> {
         );
       }
     } else {
-      const dayTotal = bucketMinutesByDay(allTimes, cap, timeZone);
-      const dayMsgs = countByDay(allTimes, timeZone);
+      const dayTotal = aggregateDays(refined);
+      const dayMsgs = countByDay(allTimes, timeZone, sinceMs, untilMs);
       console.log(`Per day (cap ${cap}min):`);
       for (const day of [...dayTotal.keys()].sort()) {
         console.log(
-          `  ${day} | ${fmtH(dayTotal.get(day) ?? 0).padStart(5)}h | ${String(dayMsgs.get(day) ?? 0).padStart(4)} events`
+          `  ${day} | ${fmtH(dayTotal.get(day)?.total ?? 0).padStart(5)}h | ${String(dayMsgs.get(day) ?? 0).padStart(4)} events`
         );
       }
     }
@@ -665,21 +685,10 @@ function printWorklogCsv(
   if (byDay) {
     console.log(CSV_HEADERS[lang].worklogDay.join(";"));
     const days = [...new Set(keys.map((k) => k.slice(0, 10)))].sort();
+    const dayStates = aggregateDays(refined);
     for (const day of days) {
       const dayHours = keys.filter((k) => k.startsWith(day));
-      const st = dayHours.reduce(
-        (acc, h) => {
-          const s = refined.byHour.get(h);
-          if (s) {
-            acc.total += s.total;
-            acc.handsOn += s.handsOn;
-            acc.supervised += s.supervised;
-            acc.ai += s.ai;
-          }
-          return acc;
-        },
-        { total: 0, handsOn: 0, supervised: 0, ai: 0 }
-      );
+      const st = dayStates.get(day) ?? { total: 0, handsOn: 0, supervised: 0, ai: 0 };
       const merged = mergeLogs(dayHours.map((h) => log.get(h)).filter((l): l is NonNullable<typeof l> => !!l));
       console.log(
         [day, fmtH(st.total), fmtH(st.handsOn), fmtH(st.supervised), fmtH(st.ai), csvField(describe(day, merged))].join(";")
@@ -694,10 +703,10 @@ function printWorklogCsv(
         [
           k.slice(0, 10),
           k.slice(11),
-          st.total.toFixed(0),
-          st.handsOn.toFixed(0),
-          st.supervised.toFixed(0),
-          st.ai.toFixed(0),
+          st.total.toFixed(1),
+          st.handsOn.toFixed(1),
+          st.supervised.toFixed(1),
+          st.ai.toFixed(1),
           csvField(l ? describe(k, l) : ""),
         ].join(";")
       );
@@ -710,10 +719,10 @@ function printWorklogCsv(
   console.log(
     [
       label,
-      byDay ? fmtH(refined.totalMinutes) : refined.totalMinutes.toFixed(0),
-      byDay ? fmtH(refined.handsOnMinutes) : refined.handsOnMinutes.toFixed(0),
-      byDay ? fmtH(refined.supervisedMinutes) : refined.supervisedMinutes.toFixed(0),
-      byDay ? fmtH(refined.aiAutonomousMinutes) : refined.aiAutonomousMinutes.toFixed(0),
+      byDay ? fmtH(refined.totalMinutes) : refined.totalMinutes.toFixed(1),
+      byDay ? fmtH(refined.handsOnMinutes) : refined.handsOnMinutes.toFixed(1),
+      byDay ? fmtH(refined.supervisedMinutes) : refined.supervisedMinutes.toFixed(1),
+      byDay ? fmtH(refined.aiAutonomousMinutes) : refined.aiAutonomousMinutes.toFixed(1),
       csvField(ai.get("OVERALL") ?? describeLog(all, 400)),
     ].join(";")
   );
@@ -821,7 +830,9 @@ function printJson(
   cap: number,
   promptCap: number,
   timeZone: TimeZoneSpec,
-  overlapping: boolean
+  overlapping: boolean,
+  sinceMs: number,
+  untilMs: number
 ): void {
   const allTimes = merged.map((e) => e.ts);
   const days = aggregateDays(refined);
@@ -832,6 +843,8 @@ function printJson(
       capMinutes: c,
       promptCapMinutes: c,
       timeZone,
+      rangeStartMs: sinceMs,
+      rangeEndMs: untilMs,
     });
     caps[String(c)] = {
       totalHours: +(s.totalMinutes / 60).toFixed(2),
@@ -851,11 +864,11 @@ function printJson(
         timeZone: typeof timeZone === "string" ? timeZone : null,
         tzOffsetHours: typeof timeZone === "number" ? timeZone : null,
         sessions: sessions.length,
-        events: merged.length,
+        events: merged.filter((event) => event.ts >= sinceMs && event.ts < untilMs).length,
         prompts: refined.promptCount,
         parallelSessions: overlapping,
         totalHours: +(refined.totalMinutes / 60).toFixed(2),
-        strictTotalHours: +(activeMinutesStrict(allTimes, cap) / 60).toFixed(2),
+        strictTotalHours: +(cappedMinutesInRange(allTimes, cap, sinceMs, untilMs, true) / 60).toFixed(2),
         handsOnHours: +(refined.handsOnMinutes / 60).toFixed(2),
         supervisedHours: +(refined.supervisedMinutes / 60).toFixed(2),
         attentionHours: +(refined.attentionMinutes / 60).toFixed(2),
@@ -883,6 +896,7 @@ function printJson(
 function runAllProjects(
   sinceMs: number,
   untilMs: number,
+  loadOptions: TimelineLoadOptions,
   cap: number,
   promptCap: number,
   timeZone: TimeZoneSpec,
@@ -919,7 +933,7 @@ function runAllProjects(
       // A machine with Codex-only history need not have ~/.claude/projects.
     }
     for (const dir of dirs) {
-      const sessions = loadProject(path.join(PROJECTS_BASE, dir), sinceMs, untilMs);
+      const sessions = loadProject(path.join(PROJECTS_BASE, dir), loadOptions);
       if (sessions.length) {
         const cwd = readClaudeProjectCwd(path.join(PROJECTS_BASE, dir));
         const key = cwd ? `path:${canonicalProjectPath(cwd)}` : `hash:${dir}`;
@@ -931,7 +945,7 @@ function runAllProjects(
   }
 
   if (wantCodex) {
-    for (const scanned of scanCodexSessions(sinceMs, untilMs)) {
+    for (const scanned of scanCodexSessions(loadOptions)) {
       const cwd = canonicalProjectPath(scanned.cwd);
       const key = `path:${cwd}`;
       const existing = projects.get(key) ?? { project: cwd, sessions: [] };
@@ -951,14 +965,18 @@ function runAllProjects(
       capMinutes: cap,
       promptCapMinutes: promptCap,
       timeZone,
+      rangeStartMs: sinceMs,
+      rangeEndMs: untilMs,
     });
+    const inRange = merged.filter((event) => event.ts >= sinceMs && event.ts < untilMs);
+    if (!inRange.length && refined.totalMinutes === 0) continue;
     rows.push({
       project,
       totalHours: +(refined.totalMinutes / 60).toFixed(2),
       attentionHours: +(refined.attentionMinutes / 60).toFixed(2),
       aiAutonomousHours: +(refined.aiAutonomousMinutes / 60).toFixed(2),
-      events: merged.length,
-      lastActivity: dayKey(merged[merged.length - 1].ts, timeZone),
+      events: inRange.length,
+      lastActivity: dayKey((inRange.at(-1) ?? merged[0]).ts, timeZone),
     });
   }
   rows.sort((a, b) => b.totalHours - a.totalHours);
@@ -968,6 +986,8 @@ function runAllProjects(
       capMinutes: cap,
       promptCapMinutes: promptCap,
       timeZone,
+      rangeStartMs: sinceMs,
+      rangeEndMs: untilMs,
     });
     console.log(
       JSON.stringify(
@@ -1008,9 +1028,14 @@ function runAllProjects(
     capMinutes: cap,
     promptCapMinutes: promptCap,
     timeZone,
+    rangeStartMs: sinceMs,
+    rangeEndMs: untilMs,
   });
   console.log();
   console.log(`  ${rows.length} projects, ${fmtH(grand.totalMinutes)} h merged wall-clock activity.`);
 }
 
+process.on("exit", () => {
+  if (unreadableFileCount > 0) console.error(`warning: ${unreadableFileCount} log files could not be read`);
+});
 main().catch((e) => fail((e as Error).message));
