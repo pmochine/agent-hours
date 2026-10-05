@@ -11,6 +11,7 @@ import { parseArgs } from "node:util";
 import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import * as os from "node:os";
 import {
   PROJECTS_BASE,
   activeMinutes,
@@ -574,7 +575,8 @@ function printCsv(refined: RefinedSplit, withSplit: boolean, lang: CsvLanguage):
 }
 
 function csvField(s: string): string {
-  return /[;"\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  const safe = /^[=+\-@\t\r]/.test(s) ? "'" + s : s;
+  return /[;"\n\r]/.test(safe) ? `"${safe.replace(/"/g, '""')}"` : safe;
 }
 
 interface SummaryBucket {
@@ -593,26 +595,35 @@ interface SummaryBucket {
 function aiSummarize(buckets: SummaryBucket[]): Map<string, string> {
   const instruction =
     "You receive JSON evidence buckets extracted from coding-agent session logs. " +
-    "For EACH bucket output exactly one line in the format <key>\\t<summary> " +
+    "Output a JSON object mapping EACH bucket key to a summary string " +
     "(summary: max 14 words, dominant language of the evidence, invoice-attachment tone). " +
-    "Finish with one line OVERALL\\t<2-3 sentence summary of the whole period>. Output nothing else.";
-  const res = spawnSync("claude", ["-p", instruction], {
-    input: JSON.stringify(buckets),
-    encoding: "utf8",
-    maxBuffer: 16 * 1024 * 1024,
-  });
-  if (res.error || res.status !== 0) {
-    fail(
-      "--summarize shells out to `claude -p` and needs the claude CLI on PATH.\n" +
-        `Error: ${res.error?.message ?? (res.stderr || "exit code " + res.status)}`
-    );
+    "Include OVERALL with a 2-3 sentence summary of the whole period. Output nothing else.";
+  try {
+    const res = spawnSync("claude", [
+      "-p", instruction, "--tools", "", "--strict-mcp-config", "--no-session-persistence",
+    ], {
+      input: JSON.stringify(buckets),
+      encoding: "utf8",
+      maxBuffer: 16 * 1024 * 1024,
+      timeout: 300000,
+      cwd: os.tmpdir(),
+    });
+    if (res.error) throw res.error;
+    if (res.status !== 0) throw new Error(`claude exited with status ${res.status}`);
+    const result: unknown = JSON.parse(res.stdout);
+    if (!result || typeof result !== "object" || Array.isArray(result)) {
+      throw new Error("expected a JSON object");
+    }
+    const knownKeys = new Set([...buckets.map((b) => b.key), "OVERALL"]);
+    const map = new Map<string, string>();
+    for (const [key, value] of Object.entries(result)) {
+      if (knownKeys.has(key) && typeof value === "string") map.set(key, value);
+    }
+    return map;
+  } catch (error) {
+    console.error(`Warning: --summarize failed; using rule-based descriptions. ${(error as Error).message}`);
+    return new Map();
   }
-  const map = new Map<string, string>();
-  for (const line of res.stdout.split("\n")) {
-    const idx = line.indexOf("\t");
-    if (idx > 0) map.set(line.slice(0, idx).trim(), line.slice(idx + 1).trim());
-  }
-  return map;
 }
 
 /**

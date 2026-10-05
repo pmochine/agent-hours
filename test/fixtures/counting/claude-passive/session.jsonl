@@ -1,0 +1,9 @@
+null
+42
+[]
+"ignored"
+{"timestamp":"2026-06-03T10:00:00Z","type":"user","version":"2.1.289","cwd":"/tmp/proj-passive","message":{"content":"Check the layout."}}
+{"timestamp":"2026-06-03T10:02:00Z","type":"assistant","version":"2.1.289","message":{"content":"Layout checked."}}
+{"timestamp":"2026-06-03T10:05:00Z","type":"system","version":"2.1.289","subtype":"away_summary","content":"Layout checked and ready for review."}
+{"timestamp":"2026-06-03T10:25:00Z","type":"assistant","version":"2.1.289","message":{"content":"Review completed."}}
+{"timestamp":"2026-06-03T10:25:00Z","type":"system","version":"2.1.289","subtype":"status","content":"Other system records still count."}

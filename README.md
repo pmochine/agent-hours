@@ -125,7 +125,7 @@ Classification details verified against current and legacy logs: scheduled-task,
 | Agent | Status | Logs read from |
 |---|---|---|
 | Claude Code | ✅ | `~/.claude/projects/<hash>/*.jsonl` + `<session>/subagents/` |
-| Codex CLI | ✅ | `$CODEX_HOME/sessions/**.jsonl` + `$CODEX_HOME/archived_sessions/**.jsonl` (default home: `~/.codex`, matched via `cwd`, deduplicated by session ID) |
+| Codex CLI | ✅ | `$CODEX_HOME/sessions/**.jsonl` + `$CODEX_HOME/archived_sessions/**.jsonl` (default home: `~/.codex`, matched via `cwd`, deduplicated by session ID and continuation segment) |
 | Gemini CLI, opencode, Cursor, Aider | planned | see adapter notes below |
 
 Adapter contract: `{ts, kind: prompt|work, presence, reactionAnchor}` events in `src/sources/`, plus worklog extraction in `src/worklog.ts` and wiring in `src/cli.ts`. The Claude Code adapter currently lives in `src/core.ts`; adapters return events inside `NamedSession[]`, and merging attaches session identity. PRs welcome.

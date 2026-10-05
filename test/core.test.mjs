@@ -14,13 +14,18 @@ import {
   findPauses,
   hourKey,
   loadProject,
+  loadSessionEvents,
   mergeEvents,
   parseDate,
   projectToHash,
+  readClaudeProjectCwd,
+  subagentJsonlFiles,
 } from "../dist/core.js";
 import { collectCodexWorklog, collectWorklog, describeLog, mergeLogs } from "../dist/worklog.js";
 import {
   canonicalProjectPath,
+  findCodexSessionFiles,
+  isSyntheticCodexUserText,
   loadCodexSessions,
   scanCodexSessions,
 } from "../dist/sources/codex.js";
@@ -32,6 +37,8 @@ const FIXTURES = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtur
 const LEGACY = path.join(FIXTURES, "legacy");
 const MODERN = path.join(FIXTURES, "modern");
 const CODEX_CURRENT = path.join(FIXTURES, "codex-current");
+const COUNTING = path.join(FIXTURES, "counting");
+const COUNTING_CODEX = [path.join(COUNTING, "codex", "sessions"), path.join(COUNTING, "codex", "archived_sessions")];
 const SINCE = 0;
 const UNTIL = Date.parse("2100-01-01T00:00:00Z");
 
@@ -280,7 +287,7 @@ test("modern fixtures: rule-based description prefers commits + away summary", (
   const all = mergeLogs([...log.values()]);
   const desc = describeLog(all);
   assert.match(desc, /Commits: Add newsletter popup/);
-  assert.match(desc, /Popup fertig gebaut/); // away_summary prose reused for free
+  assert.match(desc, /Popup completed/); // away_summary prose reused for free
   assert.match(desc, /2 files:/);
   // truncation respects maxLen
   assert.ok(describeLog(all, 40).length <= 40);
@@ -351,6 +358,133 @@ test("Codex worklog extracts evidence from current and archived schemas", () => 
 test("Codex project matching normalizes NFC and NFD paths", () => {
   const composed = "/tmp/m" + String.fromCharCode(0x00fc) + "ller";
   assert.equal(canonicalProjectPath(composed), canonicalProjectPath(composed.normalize("NFD")));
+});
+
+test("Codex continuations merge into one thread and archived segments count once", () => {
+  const files = findCodexSessionFiles("/tmp/proj-x", SINCE, UNTIL, COUNTING_CODEX);
+  assert.equal(files.length, 2);
+  assert.ok(files.every((meta) => meta.file.includes(`${path.sep}sessions${path.sep}`)));
+  assert.deepEqual(files.map((meta) => meta.historyBaseEndOrdinal).sort(), [4, null]);
+  const sessions = loadCodexSessions("/tmp/proj-x", SINCE, UNTIL, COUNTING_CODEX);
+  assert.equal(sessions.length, 1);
+  assert.equal(sessions[0].name, "codex:rollout-z-base.jsonl");
+  const events = mergeEvents(sessions);
+  assert.equal(events.length, 7);
+  assert.deepEqual(events.map((e) => e.ts), [...events.map((e) => e.ts)].sort((a, b) => a - b));
+  const split = computeRefinedSplit(events, { capMinutes: 10, promptCapMinutes: 10, timeZone: "UTC" });
+  assert.equal(split.promptCount, 2);
+  assert.equal(split.totalMinutes, 9);
+  // Both the answer anchor and writing-edit presence precede the segment boundary.
+  assert.equal(split.handsOnMinutes, 4.25);
+  assert.equal(split.supervisedMinutes, 4);
+  assert.equal(split.attentionMinutes, 8.25);
+  const log = mergeLogs([...collectCodexWorklog("/tmp/proj-x", SINCE, UNTIL, "UTC", COUNTING_CODEX).values()]);
+  assert.deepEqual(log.prompts, ["Improve the layout.", "Add layout tests."]);
+  const late = loadCodexSessions("/tmp/proj-x", Date.parse("2026-06-03T10:07:00Z"), UNTIL, COUNTING_CODEX);
+  assert.equal(late.length, 1);
+  assert.equal(late[0].name, sessions[0].name);
+  assert.equal(late[0].events.filter((e) => e.kind === "prompt").length, 1);
+});
+
+test("Codex continuation classification inherits the base segment metadata", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ah-continuation-"));
+  try {
+    for (const name of ["rollout-z-base.jsonl", "rollout-a-continuation.jsonl"]) {
+      const lines = fs.readFileSync(path.join(COUNTING_CODEX[0], name), "utf8").trim().split("\n");
+      if (name.includes("continuation")) {
+        const meta = JSON.parse(lines[0]);
+        meta.payload.source = "exec";
+        meta.payload.parent_thread_id = "parent-x";
+        lines[0] = JSON.stringify(meta);
+      }
+      fs.writeFileSync(path.join(dir, name), lines.join("\n") + "\n");
+    }
+    const files = findCodexSessionFiles("/tmp/proj-x", SINCE, UNTIL, dir);
+    assert.ok(files.every((meta) => meta.interactive && !meta.subagent));
+    const sessions = loadCodexSessions("/tmp/proj-x", SINCE, UNTIL, dir);
+    assert.equal(sessions[0].events.filter((e) => e.kind === "prompt").length, 2);
+    const log = mergeLogs([...collectCodexWorklog("/tmp/proj-x", SINCE, UNTIL, "UTC", dir).values()]);
+    assert.equal(log.prompts.length, 2);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Claude away summaries add no time after departure and remain worklog evidence", () => {
+  const dir = path.join(COUNTING, "claude-passive");
+  const events = loadSessionEvents(path.join(dir, "session.jsonl"), SINCE, UNTIL);
+  assert.deepEqual(events.map((e) => e.ts), ["00:00", "02:00", "25:00", "25:00"].map((t) => Date.parse(`2026-06-03T10:${t}Z`)));
+  assert.equal(activeMinutes(events.map((e) => e.ts), 10), 12);
+  assert.equal(readClaudeProjectCwd(dir), "/tmp/proj-passive");
+  const log = mergeLogs([...collectWorklog(dir, SINCE, UNTIL, "UTC").values()]);
+  assert.deepEqual(log.prompts, ["Check the layout."]);
+  assert.deepEqual(log.awaySummaries, ["Layout checked and ready for review."]);
+});
+
+test("Codex thread settings add no time during a pause; other event types remain", () => {
+  const sessions = loadCodexSessions("/tmp/proj-passive", SINCE, UNTIL, COUNTING_CODEX);
+  const events = mergeEvents(sessions);
+  assert.equal(events.length, 5); // session_meta, prompt, two answers, other_bookkeeping
+  assert.ok(events.every((e) => e.ts !== Date.parse("2026-06-03T10:05:00Z")));
+  assert.equal(activeMinutes(events.map((e) => e.ts), 10), 12);
+  const log = mergeLogs([...collectCodexWorklog("/tmp/proj-passive", SINCE, UNTIL, "UTC", COUNTING_CODEX).values()]);
+  assert.deepEqual(log.prompts, ["Check the layout."]);
+});
+
+test("nested Claude workflow agents count as machine work and supply edited files", () => {
+  const dir = path.join(COUNTING, "claude-workflow");
+  const subDir = path.join(dir, "session", "subagents");
+  assert.deepEqual(subagentJsonlFiles(subDir).map((file) => path.relative(subDir, file)), ["workflows/wf_x/agent-x.jsonl"]);
+  const sessions = loadProject(dir, SINCE, UNTIL);
+  assert.equal(sessions.length, 2);
+  const sub = sessions.find((session) => session.name.includes("workflows/wf_x"));
+  assert.ok(sub);
+  assert.equal(sub.events.length, 2);
+  assert.ok(sub.events.every((event) => event.kind === "work" && !event.presence));
+  const split = computeRefinedSplit(mergeEvents(sessions), { capMinutes: 10, promptCapMinutes: 10 });
+  assert.equal(split.totalMinutes, 8);
+  assert.equal(split.promptCount, 1);
+  const log = mergeLogs([...collectWorklog(dir, SINCE, UNTIL, "UTC").values()]);
+  assert.deepEqual([...log.filesEdited], ["/tmp/proj-x/src/helper.ts"]);
+  assert.deepEqual(log.prompts, ["Add a helper."]);
+});
+
+test("Codex speech, question replies, writing edits, and delegation agree with the worklog", () => {
+  const sessions = loadCodexSessions("/tmp/proj-voice", SINCE, UNTIL, COUNTING_CODEX);
+  const events = sessions[0].events;
+  const at = (time) => events.find((event) => event.ts === Date.parse(`2026-06-03T10:${time}Z`));
+  assert.equal(at("01:00").kind, "prompt");
+  assert.equal(at("01:00").presence, true);
+  assert.equal(at("03:00").kind, "work");
+  assert.equal(at("03:00").presence, false);
+  assert.equal(at("03:00").reactionAnchor, true);
+  assert.equal(at("03:06").kind, "work");
+  assert.equal(at("03:06").presence, false);
+  assert.equal(at("04:00").kind, "work");
+  assert.equal(at("04:00").presence, true);
+  assert.equal(at("08:00").kind, "prompt");
+  assert.equal(at("08:00").presence, true);
+  assert.equal(isSyntheticCodexUserText("<send_user_message_question_reply>Use blue.</send_user_message_question_reply>"), false);
+  assert.equal(isSyntheticCodexUserText("<realtime_delegation>Derived input.</realtime_delegation>"), true);
+  const split = computeRefinedSplit(mergeEvents(sessions), { capMinutes: 10, promptCapMinutes: 10 });
+  assert.equal(split.promptCount, 2);
+  assert.equal(split.handsOnMinutes, 5);
+  assert.equal(split.supervisedMinutes, 2);
+  const log = mergeLogs([...collectCodexWorklog("/tmp/proj-voice", SINCE, UNTIL, "UTC", COUNTING_CODEX).values()]);
+  assert.deepEqual(log.prompts, ["Please improve the layout.", "<send_user_message_question_reply>Use blue.</send_user_message_question_reply>"]);
+});
+
+test("Codex plugin, exec, and subagent sessions keep all human-shaped input machine work", () => {
+  for (const name of ["plugin", "exec-voice", "subagent-voice"]) {
+    const scanned = scanCodexSessions(SINCE, UNTIL, COUNTING_CODEX, `/tmp/proj-${name}`);
+    assert.equal(scanned.length, 1);
+    assert.equal(scanned[0].interactive, false);
+    assert.ok(scanned[0].session.events.every((event) => event.kind === "work" && !event.presence));
+    const spokenAnswer = scanned[0].session.events.find((event) => event.ts === Date.parse("2026-06-03T10:03:00Z"));
+    assert.equal(spokenAnswer.reactionAnchor, false);
+    const log = mergeLogs([...collectCodexWorklog(`/tmp/proj-${name}`, SINCE, UNTIL, "UTC", COUNTING_CODEX).values()]);
+    assert.deepEqual(log.prompts, []);
+  }
 });
 
 test("install: writes skills, skips missing codex, is idempotent", () => {

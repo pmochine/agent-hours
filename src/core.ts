@@ -88,7 +88,9 @@ function cwdFromJsonl(file: string): string | null {
   for (const line of raw.split("\n").slice(0, 200)) {
     if (!line.trim()) continue;
     try {
-      const cwd = (JSON.parse(line) as Record<string, unknown>)["cwd"];
+      const record = JSON.parse(line);
+      if (!record || typeof record !== "object" || Array.isArray(record)) continue;
+      const cwd = record["cwd"];
       if (typeof cwd === "string") return cwd;
     } catch {
       // Keep looking: one malformed record must not hide a usable cwd.
@@ -265,12 +267,15 @@ export function loadSessionEvents(
     } catch {
       continue;
     }
+    if (!record || typeof record !== "object" || Array.isArray(record)) continue;
     const tsStr = (record as Record<string, unknown>)?.["timestamp"];
     if (typeof tsStr !== "string") continue;
     const ts = Date.parse(tsStr);
     if (Number.isNaN(ts)) continue;
     if (ts < sinceMs || ts > untilMs) continue;
     const rawRecord = record as Record<string, unknown>;
+    // Written about 3 minutes after the last record, when the person has left.
+    if (rawRecord["type"] === "system" && rawRecord["subtype"] === "away_summary") continue;
     const reactionAnchor = rawRecord["type"] === "assistant";
     if (forceWork) {
       events.push({ ts, kind: "work", presence: false, reactionAnchor });
@@ -285,7 +290,7 @@ export function loadSessionEvents(
 
 /**
  * Loads all sessions of a project directory: top-level *.jsonl PLUS subagent
- * transcripts in <sessionUuid>/subagents/agent-*.jsonl (newer Claude Code
+ * transcripts recursively below <sessionUuid>/subagents/ (newer Claude Code
  * versions store parallel-agent work there — missing them undercounts total
  * activity whenever only subagents were running).
  */
@@ -307,18 +312,31 @@ export function loadProject(
   }
   for (const dir of entries.filter((e) => e.isDirectory()).map((e) => e.name).sort()) {
     const subDir = path.join(projectDir, dir, "subagents");
-    let subFiles: string[];
-    try {
-      subFiles = fs.readdirSync(subDir).filter((f) => f.endsWith(".jsonl")).sort();
-    } catch {
-      continue;
-    }
-    for (const f of subFiles) {
-      const events = loadSessionEvents(path.join(subDir, f), sinceMs, untilMs, true);
-      if (events.length > 0) sessions.push({ name: `${dir}/subagents/${f}`, events });
+    for (const file of subagentJsonlFiles(subDir)) {
+      const events = loadSessionEvents(file, sinceMs, untilMs, true);
+      if (events.length > 0) sessions.push({ name: path.relative(projectDir, file), events });
     }
   }
   return sessions;
+}
+
+/** Flat and workflow subagent transcripts; journals contain no timeline records. */
+export function subagentJsonlFiles(dir: string): string[] {
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  const files: string[] = [];
+  for (const entry of entries) {
+    const file = path.join(dir, entry.name);
+    if (entry.isDirectory()) files.push(...subagentJsonlFiles(file));
+    else if (entry.isFile() && entry.name.endsWith(".jsonl") && entry.name !== "journal.jsonl") {
+      files.push(file);
+    }
+  }
+  return files.sort();
 }
 
 /**

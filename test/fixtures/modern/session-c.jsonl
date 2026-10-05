@@ -5,7 +5,7 @@
 {"type":"user","promptSource":"queued","timestamp":"2026-06-02T12:04:00Z","message":{"role":"user","content":"also make the close button bigger please"}}
 {"type":"user","promptSource":"system","timestamp":"2026-06-02T12:05:00Z","message":{"role":"user","content":"<task-notification>scheduled run fired</task-notification>"}}
 {"type":"user","isCompactSummary":true,"timestamp":"2026-06-02T12:06:00Z","message":{"role":"user","content":"This session is being continued from a previous conversation."}}
-{"type":"system","subtype":"away_summary","timestamp":"2026-06-02T12:07:00Z","content":"Popup fertig gebaut, Close-Button vergroessert, naechster Schritt: Tests."}
+{"type":"system","subtype":"away_summary","timestamp":"2026-06-02T12:07:00Z","content":"Popup completed, close button enlarged, next step: tests."}
 {"type":"assistant","timestamp":"2026-06-02T12:08:00Z","message":{"role":"assistant","content":[{"type":"tool_use","name":"Bash","input":{"command":"git commit -m \"Add newsletter popup\" && git push"}}]}}
 {"type":"attachment","timestamp":"2026-06-02T12:09:00Z","attachment":{"type":"edited_text_file","filename":"/tmp/popup.liquid","snippet":"..."}}
 {"type":"user","promptSource":"typed","timestamp":"2026-06-02T12:10:00Z","message":{"role":"user","content":"looks good, ship it"}}

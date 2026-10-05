@@ -8,6 +8,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
+import { StringDecoder } from "node:string_decoder";
 import type { NamedSession, SessionEvent } from "../core.js";
 
 export const CODEX_HOME = process.env["CODEX_HOME"] || path.join(os.homedir(), ".codex");
@@ -20,6 +21,7 @@ export interface CodexSessionFile {
   file: string;
   cwd: string;
   sessionId: string | null;
+  historyBaseEndOrdinal: number | null;
   interactive: boolean;
   subagent: boolean;
   startedAt: number;
@@ -75,32 +77,49 @@ function readMeta(file: string): CodexSessionFile | null {
   try {
     const CHUNK = 65536;
     const MAX = 4 * 1024 * 1024;
-    let data = Buffer.alloc(0);
+    let pending = "";
+    const decoder = new StringDecoder("utf8");
     let pos = 0;
-    let nl = -1;
-    while (nl < 0 && pos < MAX) {
+    let rec: Record<string, unknown> | null = null;
+    while (!rec && pos < MAX) {
       const buf = Buffer.alloc(CHUNK);
       const n = fs.readSync(fd, buf, 0, CHUNK, pos);
-      if (n <= 0) break;
-      data = Buffer.concat([data, buf.subarray(0, n)]);
+      pending += n > 0 ? decoder.write(buf.subarray(0, n)) : decoder.end();
       pos += n;
-      nl = data.indexOf(0x0a);
+      const lines = pending.split("\n");
+      pending = n > 0 ? lines.pop()! : "";
+      for (const line of lines) {
+        try {
+          const parsed = JSON.parse(line);
+          if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) continue;
+          if (parsed["type"] === "session_meta") {
+            rec = parsed;
+            break;
+          }
+        } catch {
+          // Keep looking through malformed and non-object lines.
+        }
+      }
+      if (n <= 0) break;
     }
-    const firstLine = (nl >= 0 ? data.subarray(0, nl) : data).toString("utf8");
-    const rec = JSON.parse(firstLine) as Record<string, unknown>;
-    if (rec["type"] !== "session_meta") return null;
+    if (!rec) return null;
     const payload = (rec["payload"] ?? {}) as Record<string, unknown>;
     if (typeof payload["cwd"] !== "string") return null;
     const subagent = isSubagentSource(payload);
     const source = payload["source"];
     const ts = typeof rec["timestamp"] === "string" ? Date.parse(rec["timestamp"] as string) : NaN;
     const rawId = payload["id"] ?? payload["session_id"];
+    const historyBase = payload["history_base"] as Record<string, unknown> | undefined;
     return {
       file,
       cwd: payload["cwd"] as string,
       sessionId: typeof rawId === "string" ? rawId : null,
+      historyBaseEndOrdinal:
+        typeof historyBase?.["end_ordinal_exclusive"] === "number"
+          ? historyBase["end_ordinal_exclusive"] : null,
       interactive:
         !subagent &&
+        payload["originator"] !== "Claude Code" &&
         (source === undefined ||
           (typeof source === "string" && source !== "exec" && source !== "mcp")),
       subagent,
@@ -113,17 +132,15 @@ function readMeta(file: string): CodexSessionFile | null {
   }
 }
 
-function userText(payload: Record<string, unknown>): string | null {
+function userTextParts(payload: Record<string, unknown>): string[] {
   const content = payload["content"];
-  if (typeof content === "string") return content;
-  if (!Array.isArray(content)) return null;
-  const texts = content
+  if (typeof content === "string") return [content];
+  if (!Array.isArray(content)) return [];
+  return content
     .filter((c): c is Record<string, unknown> => !!c && typeof c === "object")
     .filter((c) => c["type"] === "input_text" || c["type"] === "text")
     .map((c) => c["text"])
-    .filter((t): t is string => typeof t === "string")
-    .filter((t) => !isSyntheticCodexUserText(t));
-  return texts.length ? texts.join("\n") : null;
+    .filter((t): t is string => typeof t === "string");
 }
 
 /** Known Codex-injected user-role context, not text typed by the person. */
@@ -131,7 +148,29 @@ export function isSyntheticCodexUserText(text: string): boolean {
   // Current Codex rollouts often put one or more XML-like context envelopes
   // before the real human input in the same multipart message.
   const trimmed = text.trimStart();
-  return trimmed.startsWith("<") || trimmed.startsWith("# AGENTS.md instructions for ");
+  return (trimmed.startsWith("<") && !trimmed.startsWith("<send_user_message_question_reply>")) ||
+    trimmed.startsWith("# AGENTS.md instructions for ");
+}
+
+/** Human input shared by the timeline and worklog; call only for interactive sessions. */
+export function codexHumanInput(record: Record<string, unknown>): { prompt: string | null; presence: boolean } {
+  const payload = (record["payload"] ?? {}) as Record<string, unknown>;
+  if (record["type"] === "realtime_item" && payload["type"] === "transcript_segment" &&
+      payload["role"] === "user" && typeof payload["text"] === "string") {
+    return { prompt: payload["text"], presence: true };
+  }
+  if (record["type"] === "response_item" && payload["type"] === "message" && payload["role"] === "user") {
+    const parts = userTextParts(payload);
+    const first = parts[0]?.trimStart();
+    // Delegated speech is derived agent work; writing edits prove presence only.
+    if (first?.startsWith("<realtime_delegation>")) return { prompt: null, presence: false };
+    if (first?.startsWith("<external_codex_apps_writing_block_edits>")) {
+      return { prompt: null, presence: true };
+    }
+    const text = parts.filter((part) => !isSyntheticCodexUserText(part)).join("\n");
+    if (text) return { prompt: text, presence: true };
+  }
+  return { prompt: null, presence: false };
 }
 
 function parseEvents(meta: CodexSessionFile, sinceMs: number, untilMs: number): SessionEvent[] {
@@ -153,30 +192,26 @@ function parseEvents(meta: CodexSessionFile, sinceMs: number, untilMs: number): 
     } catch {
       continue;
     }
+    if (!r || typeof r !== "object" || Array.isArray(r)) continue;
     const tsStr = r["timestamp"];
     if (typeof tsStr !== "string") continue;
     const ts = Date.parse(tsStr);
     if (Number.isNaN(ts) || ts < effectiveSince || ts > untilMs) continue;
 
-    let kind: SessionEvent["kind"] = "work";
-    let presence = false;
     const p = (r["payload"] ?? {}) as Record<string, unknown>;
-    if (meta.interactive && r["type"] === "response_item") {
-      if (p["type"] === "message" && p["role"] === "user") {
-        const text = userText(p);
-        if (text && !isSyntheticCodexUserText(text)) {
-          kind = "prompt";
-          presence = true;
-        }
-      }
-    }
+    // Bookkeeping often has no following human message (69 of 246 measured cases).
+    if (r["type"] === "event_msg" && p["type"] === "thread_settings_applied") continue;
+    const input = meta.interactive ? codexHumanInput(r) : { prompt: null, presence: false };
+    const kind: SessionEvent["kind"] = input.prompt !== null ? "prompt" : "work";
     const item = (p["item"] ?? {}) as Record<string, unknown>;
     const reactionAnchor =
       (r["type"] === "response_item" && p["type"] === "message" && p["role"] === "assistant") ||
       (r["type"] === "event_msg" &&
         p["type"] === "item_completed" &&
-        item["type"] === "AgentMessage");
-    events.push({ ts, kind, presence, reactionAnchor });
+        item["type"] === "AgentMessage") ||
+      (meta.interactive && r["type"] === "realtime_item" &&
+        p["type"] === "transcript_segment" && p["role"] === "assistant");
+    events.push({ ts, kind, presence: input.presence, reactionAnchor });
   }
   events.sort((a, b) => a.ts - b.ts);
   return events;
@@ -198,17 +233,39 @@ function scanCodexMetadata(
     for (const file of walkJsonl(dir).sort()) {
       const meta = readMeta(file);
       if (!meta) continue;
-      const dedupeKey = meta.sessionId ?? canonicalProjectPath(file);
+      const dedupeKey = JSON.stringify([meta.sessionId ?? canonicalProjectPath(file), meta.historyBaseEndOrdinal]);
       if (seenIds.has(dedupeKey)) continue;
       seenIds.add(dedupeKey);
-      if (projectPath && !belongsToProject(meta.cwd, projectPath, includeDescendants)) continue;
       files.push(meta);
     }
   }
-  return files;
+  // Continuations contain only new records. Use the base thread's source for all segments.
+  return [...groupSegments(files).values()].flatMap((segments) => {
+    const base = baseSegment(segments);
+    if (projectPath && !belongsToProject(base.cwd, projectPath, includeDescendants)) return [];
+    return segments
+      .sort((a, b) => (a.historyBaseEndOrdinal ?? -1) - (b.historyBaseEndOrdinal ?? -1))
+      .map((meta) => ({ ...meta, interactive: base.interactive, subagent: base.subagent }));
+  });
 }
 
-/** Load every unique Codex rollout once, preferring active over archived copies. */
+function groupSegments(files: CodexSessionFile[]): Map<string, CodexSessionFile[]> {
+  const threads = new Map<string, CodexSessionFile[]>();
+  for (const meta of files) {
+    const key = meta.sessionId ?? canonicalProjectPath(meta.file);
+    const segments = threads.get(key) ?? [];
+    segments.push(meta);
+    threads.set(key, segments);
+  }
+  return threads;
+}
+
+function baseSegment(segments: CodexSessionFile[]): CodexSessionFile {
+  return segments.find((meta) => meta.historyBaseEndOrdinal === null) ??
+    [...segments].sort((a, b) => a.historyBaseEndOrdinal! - b.historyBaseEndOrdinal!)[0];
+}
+
+/** Merge each thread's unique segments, preferring active over archived copies. */
 export function scanCodexSessions(
   sinceMs: number,
   untilMs: number,
@@ -217,17 +274,19 @@ export function scanCodexSessions(
   includeDescendants = true
 ): ScannedCodexSession[] {
   const scanned: ScannedCodexSession[] = [];
-  for (const meta of scanCodexMetadata(baseDir, projectPath, includeDescendants)) {
-      const events = parseEvents(meta, sinceMs, untilMs);
-      if (!events.length) continue;
-      const containingDir = baseDirs(baseDir).find((dir) => meta.file.startsWith(dir + path.sep));
-      scanned.push({
-        ...meta,
-        session: {
-          name: `codex:${path.relative(containingDir ?? path.dirname(meta.file), meta.file)}`,
-          events,
-        },
-      });
+  for (const segments of groupSegments(scanCodexMetadata(baseDir, projectPath, includeDescendants)).values()) {
+    const meta = baseSegment(segments);
+    const events = segments.flatMap((segment) => parseEvents(segment, sinceMs, untilMs))
+      .sort((a, b) => a.ts - b.ts);
+    if (!events.length) continue;
+    const containingDir = baseDirs(baseDir).find((dir) => meta.file.startsWith(dir + path.sep));
+    scanned.push({
+      ...meta,
+      session: {
+        name: `codex:${path.relative(containingDir ?? path.dirname(meta.file), meta.file)}`,
+        events,
+      },
+    });
   }
   return scanned;
 }

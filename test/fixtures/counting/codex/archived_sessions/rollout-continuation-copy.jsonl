@@ -1,0 +1,3 @@
+{"timestamp":"2026-06-03T10:04:30Z","type":"session_meta","payload":{"id":"thread-x","cwd":"/tmp/proj-x","source":"vscode","cli_version":"0.159.2","history_base":{"thread_id":"thread-x","end_ordinal_exclusive":4,"end_byte_offset":1024}}}
+{"timestamp":"2026-06-03T10:08:15Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Add layout tests."}]}}
+{"timestamp":"2026-06-03T10:09:00Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Tests pass."}]}}

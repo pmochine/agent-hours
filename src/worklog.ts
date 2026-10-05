@@ -10,11 +10,12 @@ import {
   hourKey,
   isHumanPromptSource,
   isMachineGeneratedText,
+  subagentJsonlFiles,
   type TimeZoneSpec,
 } from "./core.js";
 import {
   findCodexSessionFiles,
-  isSyntheticCodexUserText,
+  codexHumanInput,
   type CodexSessionBase,
 } from "./sources/codex.js";
 
@@ -70,13 +71,7 @@ function jsonlFiles(projectDir: string): string[] {
     .map((e) => path.join(projectDir, e.name));
   for (const dir of entries.filter((e) => e.isDirectory())) {
     const subDir = path.join(projectDir, dir.name, "subagents");
-    try {
-      for (const f of fs.readdirSync(subDir)) {
-        if (f.endsWith(".jsonl")) files.push(path.join(subDir, f));
-      }
-    } catch {
-      /* no subagents dir */
-    }
+    files.push(...subagentJsonlFiles(subDir));
   }
   return files.sort();
 }
@@ -115,6 +110,7 @@ export function collectWorklog(
       } catch {
         continue;
       }
+      if (!r || typeof r !== "object" || Array.isArray(r)) continue;
       const tsStr = r["timestamp"];
       if (typeof tsStr !== "string") continue;
       const ts = Date.parse(tsStr);
@@ -186,19 +182,6 @@ export function collectWorklog(
     }
   }
   return hours;
-}
-
-function codexMessageText(payload: Record<string, unknown>): string | null {
-  const content = payload["content"];
-  if (typeof content === "string") return content;
-  if (!Array.isArray(content)) return null;
-  const parts = content
-    .filter((c): c is Record<string, unknown> => !!c && typeof c === "object")
-    .filter((c) => c["type"] === "input_text" || c["type"] === "text")
-    .map((c) => c["text"])
-    .filter((t): t is string => typeof t === "string")
-    .filter((t) => !isSyntheticCodexUserText(t));
-  return parts.length ? parts.join("\n") : null;
 }
 
 function codexCommand(item: Record<string, unknown>): string | null {
@@ -276,18 +259,18 @@ export function collectCodexWorklog(
       } catch {
         continue;
       }
+      if (!r || typeof r !== "object" || Array.isArray(r)) continue;
       const tsStr = r["timestamp"];
       if (typeof tsStr !== "string") continue;
       const ts = Date.parse(tsStr);
       if (Number.isNaN(ts) || ts < effectiveSince || ts > untilMs) continue;
       const payload = (r["payload"] ?? {}) as Record<string, unknown>;
+      if (meta.interactive) {
+        const input = codexHumanInput(r);
+        if (input.prompt !== null) bucket(ts).prompts.push(excerpt(input.prompt));
+      }
 
       if (r["type"] === "response_item") {
-        if (meta.interactive && payload["type"] === "message" && payload["role"] === "user") {
-          const text = codexMessageText(payload);
-          if (text && !isSyntheticCodexUserText(text)) bucket(ts).prompts.push(excerpt(text));
-        }
-
         // Legacy Codex tool-call schema. Newer logs expose richer normalized
         // item_completed records below, so this is intentionally conservative.
         if (payload["type"] === "function_call" || payload["type"] === "custom_tool_call") {

@@ -1,0 +1,4 @@
+{"timestamp":"2026-06-03T10:00:00Z","type":"session_meta","payload":{"id":"thread-x","cwd":"/tmp/proj-x","source":"vscode","cli_version":"0.159.2"}}
+{"timestamp":"2026-06-03T10:00:00Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Improve the layout."}]}}
+{"timestamp":"2026-06-03T10:02:00Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<external_codex_apps_writing_block_edits>Updated title.</external_codex_apps_writing_block_edits>"},{"type":"input_text","text":"Derived edit details."}]}}
+{"timestamp":"2026-06-03T10:04:00Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Layout is ready."}]}}

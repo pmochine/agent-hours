@@ -1,0 +1,7 @@
+{"timestamp":"2026-06-03T10:00:00Z","type":"session_meta","payload":{"id":"plugin","cwd":"/tmp/proj-plugin","source":"vscode","cli_version":"0.159.2","originator":"Claude Code"}}
+{"timestamp":"2026-06-03T10:01:00Z","type":"realtime_item","payload":{"type":"transcript_segment","role":"user","text":"Please improve the layout.","id":"speech-user-x","realtime_session_id":"voice-x"}}
+{"timestamp":"2026-06-03T10:03:00Z","type":"realtime_item","payload":{"type":"transcript_segment","role":"assistant","text":"Which color should I use?","id":"speech-assistant-x","realtime_session_id":"voice-x"}}
+{"timestamp":"2026-06-03T10:03:06Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<realtime_delegation>Improve the layout.</realtime_delegation>"},{"type":"input_text","text":"Derived speech details."}]}}
+{"timestamp":"2026-06-03T10:04:00Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<external_codex_apps_writing_block_edits>New heading.</external_codex_apps_writing_block_edits>"},{"type":"input_text","text":"Derived edit details."}]}}
+{"timestamp":"2026-06-03T10:08:00Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<send_user_message_question_reply>Use blue.</send_user_message_question_reply>"}]}}
+{"timestamp":"2026-06-03T10:09:00Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Updated the layout."}]}}
