@@ -18,7 +18,7 @@ import {
   mergeEvents,
   parseDate,
   projectToHash,
-  readClaudeProjectCwd,
+  claudeFileProjectCwd,
   subagentJsonlFiles,
 } from "../dist/core.js";
 import { collectCodexWorklog, collectWorklog, describeLog, mergeLogs } from "../dist/worklog.js";
@@ -420,7 +420,7 @@ test("Claude away summaries add no time after departure and remain worklog evide
   const events = loadSessionEvents(path.join(dir, "session.jsonl"));
   assert.deepEqual(events.map((e) => e.ts), ["00:00", "02:00", "25:00", "25:00"].map((t) => Date.parse(`2026-06-03T10:${t}Z`)));
   assert.equal(cappedMinutesInRange(events.map((e) => e.ts), 10), 12);
-  assert.equal(readClaudeProjectCwd(dir), "/tmp/proj-passive");
+  assert.equal(claudeFileProjectCwd(path.join(dir, "session.jsonl"), dir), "/tmp/proj-passive");
   const log = mergeLogs([...collectWorklog(dir, SINCE, UNTIL, "UTC").values()]);
   assert.deepEqual(log.prompts, ["Check the layout."]);
   assert.deepEqual(log.awaySummaries, ["Layout checked and ready for review."]);
@@ -999,5 +999,224 @@ test("loaded subagent edits suppress normalized edited-file proof in the parent"
     assert.equal(split.supervisedMinutes, 0);
     fs.rmSync(path.join(subagents, "agent-1.jsonl"));
     assert.equal(computeRefinedSplit(mergeEvents(loadProject(dir)), { capMinutes: 10, promptCapMinutes: 10 }).supervisedMinutes, 1);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("openStart allocates the first loaded prompt window only when pruning is reported", () => {
+  const [start, presence, prompt] = minutes(0, 2, 2.25);
+  const events = [
+    { ts: start, kind: "work", presence: false, reactionAnchor: true, session: "s" },
+    { ts: presence, kind: "work", presence: true, session: "s" },
+    { ts: prompt, kind: "prompt", presence: true, session: "s" },
+  ];
+  const options = { capMinutes: 10, promptCapMinutes: 10, timeZone: "UTC" };
+  const closed = computeRefinedSplit(events, options);
+  assert.equal(closed.handsOnMinutes, 0);
+  assert.equal(closed.supervisedMinutes, 0);
+  const open = computeRefinedSplit(events, { ...options, openStart: true });
+  near(open.handsOnMinutes, 2.25);
+  near(open.upperBoundMinutes, 2.25);
+  assertHourInvariants(open);
+  events[1].reactionAnchor = true;
+  const anchored = computeRefinedSplit(events, { ...options, openStart: true });
+  near(anchored.handsOnMinutes, 0.25);
+  near(anchored.supervisedMinutes, 2);
+  near(anchored.upperBoundMinutes, 2.25);
+  assertHourInvariants(anchored);
+  events[0] = { ...events[0], kind: "prompt", presence: true, reactionAnchor: false };
+  assert.deepEqual(computeRefinedSplit(events, { ...options, openStart: true }), computeRefinedSplit(events, options));
+});
+
+test("timeline loaders report pruned Claude and Codex files", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ah-prune-report-"));
+  try {
+    const cutoff = Date.parse("2026-09-02T00:00:00Z");
+    const old = new Date("2026-09-01T00:00:00Z");
+    const file = path.join(dir, "old.jsonl");
+    fs.writeFileSync(file, JSON.stringify({ type: "user", timestamp: old.toISOString(), cwd: "/tmp/project", message: { content: "Old prompt." } }));
+    fs.utimesSync(file, old, old);
+    const stats = { prunedFiles: 0 };
+    assert.deepEqual(loadProject(dir, { pruneBeforeMs: cutoff, stats }, "/tmp/project"), []);
+    assert.equal(stats.prunedFiles, 1);
+    fs.writeFileSync(file, JSON.stringify({ type: "session_meta", timestamp: old.toISOString(), payload: { id: "old", cwd: "/tmp/project", source: "cli" } }));
+    fs.utimesSync(file, old, old);
+    assert.deepEqual(loadCodexSessions("/tmp/project", { pruneBeforeMs: cutoff, stats }, dir), []);
+    assert.equal(stats.prunedFiles, 2);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("header caches use 64 KB reads and invalidate on file size or mtime changes", async () => {
+  const { syncBuiltinESMExports } = await import("node:module");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ah-header-cache-"));
+  const claude = path.join(dir, "claude.jsonl");
+  const codexDir = path.join(dir, "codex");
+  fs.mkdirSync(codexDir);
+  const codex = path.join(codexDir, "rollout.jsonl");
+  const claudeRecord = (cwd) => JSON.stringify({ type: "assistant", cwd });
+  const codexRecord = (cwd) => JSON.stringify({ type: "session_meta", payload: { id: "cached", cwd, source: "cli" } });
+  fs.writeFileSync(claude, claudeRecord("/tmp/cache-a"));
+  fs.writeFileSync(codex, codexRecord("/tmp/cache-a"));
+  const originalRead = fs.readSync;
+  const lengths = [];
+  fs.readSync = (fd, buffer, offset, length, position) => {
+    lengths.push(length);
+    return originalRead(fd, buffer, offset, length, position);
+  };
+  syncBuiltinESMExports();
+  try {
+    const read = () => {
+      assert.equal(claudeFileProjectCwd(claude, dir), "/tmp/cache-a");
+      assert.equal(findCodexSessionFiles("/tmp/cache-a", codexDir).length, 1);
+    };
+    read();
+    const initialReads = lengths.length;
+    read();
+    assert.equal(lengths.length, initialReads);
+    assert.ok(lengths.every((length) => length === 64 * 1024));
+    // Same size, different mtime: both cached identities must change.
+    fs.writeFileSync(claude, claudeRecord("/tmp/cache-b"));
+    fs.writeFileSync(codex, codexRecord("/tmp/cache-b"));
+    const modified = new Date(Date.now() + 10000);
+    fs.utimesSync(claude, modified, modified);
+    fs.utimesSync(codex, modified, modified);
+    assert.equal(claudeFileProjectCwd(claude, dir), "/tmp/cache-b");
+    assert.equal(findCodexSessionFiles("/tmp/cache-a", codexDir).length, 0);
+    assert.equal(findCodexSessionFiles("/tmp/cache-b", codexDir).length, 1);
+    const afterMtime = lengths.length;
+    // Different size, same mtime: invalidate again.
+    fs.writeFileSync(claude, claudeRecord("/tmp/cache-long"));
+    fs.writeFileSync(codex, codexRecord("/tmp/cache-long"));
+    fs.utimesSync(claude, modified, modified);
+    fs.utimesSync(codex, modified, modified);
+    assert.equal(claudeFileProjectCwd(claude, dir), "/tmp/cache-long");
+    assert.equal(findCodexSessionFiles("/tmp/cache-long", codexDir).length, 1);
+    assert.ok(lengths.length > afterMtime);
+    assert.ok(lengths.every((length) => length === 64 * 1024));
+    const beforePrune = lengths.length;
+    const old = new Date("2026-09-01");
+    fs.utimesSync(claude, old, old);
+    assert.deepEqual(loadProject(dir, { pruneBeforeMs: Date.parse("2026-09-02") }, "/tmp/cache-long"), []);
+    assert.equal(lengths.length, beforePrune); // Prune before reading a matching header.
+  } finally {
+    fs.readSync = originalRead;
+    syncBuiltinESMExports();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("hourKey caches within each quarter-hour and keeps zones and DST folds distinct", () => {
+  const original = Intl.DateTimeFormat.prototype.formatToParts;
+  let calls = 0;
+  Intl.DateTimeFormat.prototype.formatToParts = function (...args) {
+    calls++;
+    return original.apply(this, args);
+  };
+  try {
+    const ts = Date.parse("2042-01-01T10:01:00Z");
+    assert.equal(hourKey(ts, "Asia/Kathmandu"), "2042-01-01 15:00");
+    assert.equal(calls, 2);
+    assert.equal(hourKey(ts + 12 * 60000, "Asia/Kathmandu"), "2042-01-01 15:00");
+    assert.equal(calls, 2);
+    assert.equal(hourKey(ts, "UTC"), "2042-01-01 10:00");
+    assert.equal(calls, 4);
+    assert.equal(hourKey(ts + 15 * 60000, "Asia/Kathmandu"), "2042-01-01 16:00");
+    assert.equal(calls, 6);
+    assert.equal(hourKey(ts, 5.75), "2042-01-01 15:00");
+    assert.equal(hourKey(ts, -3.5), "2042-01-01 06:00");
+  } finally { Intl.DateTimeFormat.prototype.formatToParts = original; }
+});
+
+test("Claude subagent classification ignores subagents in the projects base path", () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "ah-relative-subagent-"));
+  const dir = path.join(base, "subagents", "projects", "project");
+  try {
+    const subdir = path.join(dir, "session", "subagents", "workflows");
+    fs.mkdirSync(subdir, { recursive: true });
+    const prompt = { type: "user", timestamp: "2026-09-05T10:00:00Z", message: { content: "Human input." } };
+    fs.writeFileSync(path.join(dir, "session.jsonl"), JSON.stringify(prompt));
+    fs.writeFileSync(path.join(subdir, "agent.jsonl"), JSON.stringify(prompt));
+    const sessions = loadProject(dir);
+    assert.equal(sessions.find((session) => session.name === "session.jsonl").events[0].kind, "prompt");
+    assert.equal(sessions.find((session) => session.name.endsWith("agent.jsonl")).events[0].kind, "work");
+    const logs = mergeLogs([...collectWorklog(dir, SINCE, UNTIL, "UTC").values()]);
+    assert.deepEqual(logs.prompts, ["Human input."]);
+  } finally { fs.rmSync(base, { recursive: true, force: true }); }
+});
+
+test("cwd-less Claude edits resolve against the requested project or stay relative", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ah-relative-edits-"));
+  const project = "/tmp/relative-project";
+  const projectDir = path.join(dir, projectToHash(project));
+  fs.mkdirSync(projectDir);
+  const file = path.join(projectDir, "session.jsonl");
+  const records = [
+    { type: "assistant", timestamp: "2026-09-05T10:00:00Z", message: { content: [{ type: "tool_use", name: "Edit", input: { file_path: "src/app.ts" } }] } },
+    { type: "attachment", timestamp: "2026-09-05T10:01:00Z", attachment: { type: "edited_text_file", filename: "src/app.ts" } },
+  ];
+  try {
+    fs.writeFileSync(file, records.map((record) => JSON.stringify(record)).join("\n"));
+    const relative = loadSessionEvents(file);
+    assert.deepEqual(relative[0].agentEdits, ["src/app.ts"]);
+    assert.equal(relative[1].editedPath, "src/app.ts");
+    const loaded = loadProject(projectDir, {}, project)[0].events;
+    assert.deepEqual(loaded[0].agentEdits, [project + "/src/app.ts"]);
+    assert.equal(loaded[1].editedPath, project + "/src/app.ts");
+    records[0].cwd = "/tmp/session-project";
+    fs.writeFileSync(file, records.map((record) => JSON.stringify(record)).join("\n"));
+    const known = loadSessionEvents(file, {}, false, project);
+    assert.deepEqual(known[0].agentEdits, ["/tmp/session-project/src/app.ts"]);
+    assert.equal(known[1].editedPath, "/tmp/session-project/src/app.ts");
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("Codex metadata must be the first object record and cached rejections invalidate", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ah-first-meta-"));
+  const file = path.join(dir, "rollout.jsonl");
+  const meta = { type: "session_meta", timestamp: "2026-09-05T10:00:00Z", payload: { id: "first-meta", cwd: "/tmp/project", source: "cli" } };
+  const event = { type: "event_msg", timestamp: "2026-09-05T10:01:00Z", payload: { type: "task_started" } };
+  try {
+    fs.writeFileSync(file, [event, meta].map((record) => JSON.stringify(record)).join("\n"));
+    assert.deepEqual(findCodexSessionFiles("/tmp/project", dir), []);
+    assert.deepEqual(scanCodexSessions({}, dir), []);
+    fs.writeFileSync(file, "\nmalformed\nnull\n" + [meta, event].map((record) => JSON.stringify(record)).join("\n"));
+    assert.equal(findCodexSessionFiles("/tmp/project", dir).length, 1);
+    assert.equal(scanCodexSessions({}, dir).length, 1);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("Codex metadata and timeline scans preserve multiple threads and id-less files", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ah-grouped-threads-"));
+  const active = path.join(dir, "sessions");
+  const archived = path.join(dir, "archived_sessions");
+  fs.mkdirSync(active);
+  fs.mkdirSync(archived);
+  const write = (base, name, id, ordinal, source, minute) => {
+    const meta = {
+      type: "session_meta", timestamp: `2026-09-05T10:0${minute}:00Z`,
+      payload: { cwd: "/tmp/grouped-project", source, ...(id ? { id } : {}), ...(ordinal === null ? {} : { history_base: { end_ordinal_exclusive: ordinal } }) },
+    };
+    const prompt = { type: "response_item", timestamp: meta.timestamp, payload: { type: "message", role: "user", content: "Grouped input." } };
+    fs.writeFileSync(path.join(base, name), [meta, prompt].map((record) => JSON.stringify(record)).join("\n"));
+  };
+  try {
+    write(active, "a-base.jsonl", "thread-a", null, "cli", 0);
+    write(active, "a-next.jsonl", "thread-a", 2, "exec", 1);
+    write(archived, "a-copy.jsonl", "thread-a", null, "cli", 0);
+    write(active, "b.jsonl", "thread-b", null, "exec", 2);
+    write(active, "anonymous-a.jsonl", null, null, "cli", 3);
+    write(active, "anonymous-b.jsonl", null, null, "cli", 4);
+    const bases = [active, archived];
+    const metadata = findCodexSessionFiles("/tmp/grouped-project", bases);
+    assert.equal(metadata.length, 5);
+    assert.ok(metadata.every((meta) => meta.file.startsWith(active + path.sep)));
+    assert.ok(metadata.filter((meta) => meta.sessionId === "thread-a").every((meta) => meta.interactive));
+    const scanned = scanCodexSessions({}, bases, "/tmp/grouped-project");
+    assert.equal(scanned.length, 4);
+    assert.equal(scanned.find((meta) => meta.sessionId === "thread-a").session.events.filter((event) => event.kind === "prompt").length, 2);
+    assert.equal(scanned.find((meta) => meta.sessionId === "thread-b").session.events.filter((event) => event.kind === "prompt").length, 0);
+    const anonymous = scanned.filter((meta) => meta.sessionId === null);
+    assert.equal(anonymous.length, 2);
+    assert.equal(new Set(anonymous.map((meta) => meta.session.name)).size, 2);
+    assert.equal(mergeEvents(scanned.map((meta) => meta.session)).length, 10);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });

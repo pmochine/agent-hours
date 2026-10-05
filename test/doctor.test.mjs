@@ -265,3 +265,20 @@ test("doctor recognizes only the three approved canary additions", () => {
     assert.deepEqual(report.scan.unknownSources, []);
   });
 });
+
+test("doctor treats a bare subagent source as machine work without unknown-source warnings", () => {
+  fixture(({ sessions, write, run }) => {
+    write(path.join(sessions, "bare-subagent.jsonl"), [
+      { type: "session_meta", timestamp: stamp(0), payload: { id: "bare-subagent", cwd: "/tmp/doctor-project", source: { subagent: "review" } } },
+      { type: "response_item", timestamp: stamp(20), payload: { type: "message", role: "user", content: "Delegated work." } },
+      { type: "response_item", timestamp: stamp(23), payload: { type: "message", role: "assistant", content: "Completed." } },
+    ]);
+    const result = run(["--json"]);
+    assert.equal(result.status, 0, result.stderr);
+    const report = JSON.parse(result.stdout);
+    assert.deepEqual(report.scan.unknownSources, []);
+    assert.equal(report.status, "doctor: OK");
+    // A human-shaped message after a long gap stays a passive candidate.
+    assert.deepEqual(report.passiveCandidates, [{ kind: "codex:response_item|message|", count: 1 }]);
+  });
+});

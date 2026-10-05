@@ -36,6 +36,8 @@ export interface SessionEvent {
 export interface TimelineLoadOptions {
   /** Skip event bodies in append-only files older than this cutoff. */
   pruneBeforeMs?: number;
+  /** Mutable report of files whose event bodies were skipped. */
+  stats?: { prunedFiles: number };
 }
 
 export interface NamedSession {
@@ -91,14 +93,21 @@ function canonicalPath(p: string): string {
   }
 }
 
+const cwdCache = new Map<string, { mtimeMs: number; size: number; cwd: string | null }>();
+
 function cwdFromJsonl(file: string): string | null {
+  let stat: fs.Stats | undefined;
+  try { stat = fs.statSync(file); } catch { /* The reader reports unreadable files. */ }
+  const cached = cwdCache.get(file);
+  if (stat && cached?.mtimeMs === stat.mtimeMs && cached.size === stat.size) return cached.cwd;
   let cwd: string | null = null;
   forEachJsonlRecord(file, (record) => {
     if (typeof record["cwd"] === "string") {
       cwd = record["cwd"];
       return false;
     }
-  }, { maxLines: 200 });
+  }, { maxLines: 200, chunkSize: 64 * 1024 });
+  if (stat) cwdCache.set(file, { mtimeMs: stat.mtimeMs, size: stat.size, cwd });
   return cwd;
 }
 
@@ -110,7 +119,7 @@ export function claudeFileMatchesProject(
   includeDescendants = true
 ): boolean {
   const project = canonicalPath(projectPath);
-  const cwd = cwdFromJsonl(file);
+  const cwd = claudeFileProjectCwd(file, projectDir);
   if (cwd === null) return path.basename(projectDir) === projectToHash(project);
   const actual = canonicalPath(cwd);
   return actual === project || (includeDescendants && actual.startsWith(project + path.sep));
@@ -120,7 +129,8 @@ export function claudeFileMatchesProject(
 export function claudeProjectFiles(
   projectDir: string,
   projectPath?: string,
-  includeDescendants = true
+  includeDescendants = true,
+  options: TimelineLoadOptions = {}
 ): string[] {
   let entries: fs.Dirent[];
   try {
@@ -130,37 +140,40 @@ export function claudeProjectFiles(
   }
   const matches = (file: string) => !projectPath ||
     claudeFileMatchesProject(file, projectDir, projectPath, includeDescendants);
-  const parents = new Map<string, boolean>();
+  const pruned = (file: string): boolean => {
+    if (!isLogFileBefore(file, options.pruneBeforeMs)) return false;
+    if (options.stats) options.stats.prunedFiles++;
+    return true;
+  };
+  const parents = new Map<string, string>();
   const files: string[] = [];
   for (const entry of entries.filter((e) => e.isFile() && e.name.endsWith(".jsonl")).sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0)) {
     const file = path.join(projectDir, entry.name);
-    const include = matches(file);
-    parents.set(entry.name.slice(0, -6), include);
-    if (include) files.push(file);
+    parents.set(entry.name.slice(0, -6), file);
+    if (!pruned(file) && matches(file)) files.push(file);
   }
   for (const entry of entries.filter((e) => e.isDirectory()).sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0)) {
     const parent = parents.get(entry.name);
-    if (parent === false) continue;
     for (const file of subagentJsonlFiles(path.join(projectDir, entry.name, "subagents"))) {
-      if (parent === true || matches(file)) files.push(file);
+      if (pruned(file)) continue;
+      // An old parent header is still needed to identify a fresh subagent.
+      if (matches(parent ?? file)) files.push(file);
     }
   }
   return files;
 }
 
-/** Best-effort readable cwd for a Claude project directory. */
-export function readClaudeProjectCwd(projectDir: string): string | null {
-  let files: string[];
-  try {
-    files = fs.readdirSync(projectDir).filter((f) => f.endsWith(".jsonl")).sort();
-  } catch {
-    return null;
-  }
-  for (const file of files) {
-    const cwd = cwdFromJsonl(path.join(projectDir, file));
-    if (cwd) return canonicalPath(cwd);
-  }
-  return null;
+/** Parent identity for subagents; otherwise each file's own canonical cwd. */
+export function claudeFileProjectCwd(file: string, projectDir: string): string | null {
+  const parts = path.relative(projectDir, file).split(path.sep);
+  const parent = parts[1] === "subagents" ? path.join(projectDir, parts[0] + ".jsonl") : file;
+  const identityFile = parent !== file && fs.existsSync(parent) ? parent : file;
+  const cwd = cwdFromJsonl(identityFile);
+  return cwd === null ? null : canonicalPath(cwd);
+}
+
+export function isClaudeSubagentFile(file: string, projectDir: string): boolean {
+  return path.relative(projectDir, file).split(path.sep)[1] === "subagents";
 }
 
 /**
@@ -308,11 +321,15 @@ export function classifyKind(record: unknown): EventKind {
 export function loadSessionEvents(
   jsonlPath: string,
   options: TimelineLoadOptions = {},
-  forceWork = false
+  forceWork = false,
+  projectPath?: string
 ): SessionEvent[] {
-  if (isLogFileBefore(jsonlPath, options.pruneBeforeMs)) return [];
+  if (isLogFileBefore(jsonlPath, options.pruneBeforeMs)) {
+    if (options.stats) options.stats.prunedFiles++;
+    return [];
+  }
   const events: SessionEvent[] = [];
-  let cwd = cwdFromJsonl(jsonlPath) ?? process.cwd();
+  let cwd = cwdFromJsonl(jsonlPath) ?? projectPath;
   forEachJsonlRecord(jsonlPath, (record) => {
     if (typeof record["cwd"] === "string") cwd = record["cwd"];
     const tsStr = record["timestamp"];
@@ -352,9 +369,9 @@ export function loadProject(
   includeDescendants = true
 ): NamedSession[] {
   const sessions: NamedSession[] = [];
-  for (const file of claudeProjectFiles(projectDir, projectPath, includeDescendants)) {
-    const forceWork = file.includes(`${path.sep}subagents${path.sep}`);
-    const events = loadSessionEvents(file, options, forceWork);
+  for (const file of claudeProjectFiles(projectDir, projectPath, includeDescendants, options)) {
+    const forceWork = isClaudeSubagentFile(file, projectDir);
+    const events = loadSessionEvents(file, options, forceWork, projectPath);
     if (events.length > 0) sessions.push({ name: path.relative(projectDir, file), events });
   }
   return sessions;
@@ -482,13 +499,22 @@ export function dayKey(tsMs: number, zone: TimeZoneSpec): string {
   return `${p.year}-${p.month}-${p.day}`;
 }
 
-/** Local-hour key (YYYY-MM-DD HH:00), supporting daylight-saving changes. */
+const hourKeyCache = new Map<TimeZoneSpec, Map<number, string>>();
+
+/** Local-hour key, assuming quarter-hour offsets (validated for CLI fixed offsets). */
 export function hourKey(tsMs: number, zone: TimeZoneSpec): string {
+  const slot = Math.floor(tsMs / (15 * 60000));
+  const cache = hourKeyCache.get(zone) ?? new Map<number, string>();
+  hourKeyCache.set(zone, cache);
+  const cached = cache.get(slot);
+  if (cached !== undefined) return cached;
   const p = localParts(tsMs, zone);
   const label = `${p.year}-${p.month}-${p.day} ${p.hour}:00`;
   const previous = localParts(tsMs - 3600_000, zone);
   const previousLabel = `${previous.year}-${previous.month}-${previous.day} ${previous.hour}:00`;
-  return previousLabel === label ? label + " (repeated)" : label;
+  const key = previousLabel === label ? label + " (repeated)" : label;
+  cache.set(slot, key);
+  return key;
 }
 
 export function dateTimeKey(tsMs: number, zone: TimeZoneSpec): string {
@@ -521,6 +547,8 @@ export interface RefinedSplit {
 }
 
 export interface RefinedOptions {
+  /** Pruning can remove the prompt that opened the first loaded window. */
+  openStart?: boolean;
   capMinutes: number;
   promptCapMinutes: number;
   rangeStartMs?: number;
@@ -598,18 +626,19 @@ export function computeRefinedSplit(
     const evidence = event.session ? session : global;
     if (event.kind === "prompt") {
       if (event.ts >= rangeStart && event.ts < rangeEnd) promptCount++;
-      if (previousPrompt >= 0) {
+      const windowStart = previousPrompt >= 0 ? previousPrompt : opts.openStart ? 0 : -1;
+      if (windowStart >= 0) {
         const anchor = evidence.anchor > evidence.prompt ? evidence.anchor : evidence.prompt;
         const reactionMin = anchor >= 0 ? (event.ts - merged[anchor].ts) / 60000 : Infinity;
         let creditedWindow = 0;
-        for (let j = previousPrompt; j < i; j++) creditedWindow += gaps[j].credit;
+        for (let j = windowStart; j < i; j++) creditedWindow += gaps[j].credit;
         const budget = Math.min(creditedWindow, opts.promptCapMinutes);
         const tail = Math.min(Number.isFinite(reactionMin) ? reactionMin : 0, budget);
         const proof = event.midTurn === true || evidence.presence > previousPrompt;
         const weight = proof || reactionMin <= WATCH_FULL ? 1 : reactionMin <= WATCH_HALF ? 0.5 : 0;
 
         let tailLeft = tail;
-        for (let j = i - 1; j >= previousPrompt && tailLeft > 0; j--) {
+        for (let j = i - 1; j >= windowStart && tailLeft > 0; j--) {
           const take = Math.min(gaps[j].credit, tailLeft);
           gaps[j].handsOn = take;
           tailLeft -= take;
@@ -619,8 +648,8 @@ export function computeRefinedSplit(
         let upperLeft = budget - tail;
         let supLeft = upperLeft * weight;
         let remainingCapacity = 0;
-        for (let j = previousPrompt; j < i; j++) remainingCapacity += gaps[j].credit - gaps[j].handsOn;
-        for (let j = previousPrompt; j < i; j++) {
+        for (let j = windowStart; j < i; j++) remainingCapacity += gaps[j].credit - gaps[j].handsOn;
+        for (let j = windowStart; j < i; j++) {
           const gap = gaps[j];
           const capacity = gap.credit - gap.handsOn;
           const upper = remainingCapacity > 0 ? Math.min(capacity, upperLeft * capacity / remainingCapacity) : 0;
@@ -643,9 +672,9 @@ export function computeRefinedSplit(
   }
 
   // Allocation is independent of the range. Clip uniformly spread gap states,
-  // then divide the segments at UTC quarter-hours (including DST folds).
+  // then divide at UTC quarter-hours (including DST folds). This assumes
+  // quarter-hour zone offsets, also required by hourKey caching.
   const byHour = new Map<string, HourStates>();
-  const hourCache = new Map<number, string>();
   const SLOT = 15 * 60000;
   let total = 0;
   let handsOn = 0;
@@ -658,11 +687,7 @@ export function computeRefinedSplit(
     while (start < end) {
       const slot = Math.floor(start / SLOT) * SLOT;
       const partEnd = Math.min(end, slot + SLOT);
-      let key = hourCache.get(slot);
-      if (!key) {
-        key = hourKey(slot, timeZone);
-        hourCache.set(slot, key);
-      }
+      const key = hourKey(slot, timeZone);
       const bucket = byHour.get(key) ?? { total: 0, handsOn: 0, supervised: 0, ai: 0, upper: 0 };
       const minutes = (partEnd - start) / 60000;
       const fraction = minutes / gap.credit;

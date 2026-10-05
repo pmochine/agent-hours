@@ -114,7 +114,7 @@ When hours look wrong or after an agent update, run `agent-hours doctor`. It rep
 
 **Idle-cap timing** sums the gaps between consecutive events and caps each gap at a configurable limit. This is a common activity-log technique, but it is still a model rather than a stopwatch. The output shows several caps (1/2/3/5/10/15) plus a *strict* column (pause > cap counts zero), so you can see the sensitivity of the result.
 
-Credited time is placed immediately after the earlier event, up to the next event or the cap. Date ranges and hourly buckets clip those intervals; adjacent ranges add up to the whole period. The repeated daylight-saving hour is shown separately as `HH:00 (repeated)`. Hourly worklog CSV minutes have one decimal.
+Credited time is placed immediately after the earlier event, up to the next event or the cap. Date ranges and hourly buckets clip those intervals; adjacent ranges add up to the whole period. `--since` is inclusive; `--until` with a time is exclusive, while a date-only `--until` includes the whole local day. The repeated daylight-saving hour is shown separately as `HH:00 (repeated)`. Hourly worklog CSV minutes have one decimal.
 
 **The three-state split** answers the question a binary human/AI split gets wrong — *was the human actually there while the agent worked?*
 
@@ -136,9 +136,9 @@ Classification details verified against current and legacy logs: scheduled-task,
 
 Adapter contract: `{ts, kind: prompt|work, presence, reactionAnchor, editedPath?, agentEdits?}` events in `src/sources/`, plus worklog extraction in `src/worklog.ts` and wiring in `src/cli.ts`. The Claude Code adapter currently lives in `src/core.ts`; adapters return events inside `NamedSession[]`, and merging attaches session identity. PRs welcome.
 
-Sessions started in subdirectories of the project are included for both Claude and Codex. Claude workflow subagents below `subagents/workflows/wf_*/` count as machine work. Codex long threads can span continuation files (`history_base`); unique segments merge using the base thread’s classification, and archived copies count once.
+Sessions started in subdirectories of the project are included for both Claude and Codex. `--all-projects` groups Claude files by their own canonical `cwd`, with subagents following their parent; files without `cwd` are grouped under their log directory. Claude workflow subagents below `subagents/workflows/wf_*/` count as machine work. Codex long threads can span continuation files (`history_base`); unique segments merge using the base thread’s classification, and archived copies count once.
 
-Logs are read as streams, so large transcripts do not need to fit in memory. `--since` skips event bodies in files whose modification times predate its context window, speeding up recent reports; old Codex base metadata is still read to classify continuations. Doctor flags schema drift and unreadable or unsupported files before you rely on a report.
+Logs are read as streams, so large transcripts do not need to fit in memory. `--since` skips event bodies in files whose modification times predate its context window, speeding up recent reports; old Codex base metadata is still read to classify continuations. After pruning, the first loaded prompt gets a window from the first loaded event: the direct-interaction tail and reaction weight remain exact, while the proportional supervised share of a window that began in a pruned file can differ. Doctor flags schema drift and unreadable or unsupported files before you rely on a report.
 
 ## Retroactive use & log retention
 

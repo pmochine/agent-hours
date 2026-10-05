@@ -61,45 +61,52 @@ export function canonicalProjectPath(p: string): string {
   }
 }
 
-function isSubagentSource(payload: Record<string, unknown>): boolean {
+/** Shared adapter/doctor classification of the unflattened session metadata. */
+export function classifyCodexSessionMeta(payload: Record<string, unknown>): { interactive: boolean; subagent: boolean } {
   const source = payload["source"];
-  if (source && typeof source === "object" && "subagent" in source) return true;
-  return payload["thread_source"] === "subagent" || typeof payload["parent_thread_id"] === "string";
+  const subagent = !!(source && typeof source === "object" && "subagent" in source) ||
+    payload["thread_source"] === "subagent" || typeof payload["parent_thread_id"] === "string";
+  return {
+    subagent,
+    interactive: !subagent && payload["originator"] !== "Claude Code" &&
+      (source === undefined || (typeof source === "string" && source !== "exec" && source !== "mcp")),
+  };
 }
 
-/** Read the first session_meta only; later metadata may be inherited context. */
+const metaCache = new Map<string, { mtimeMs: number; size: number; meta: CodexSessionFile | null }>();
+
+/** The first object record must be session_meta; later records may be inherited context. */
 function readMeta(file: string): CodexSessionFile | null {
+  let stat: fs.Stats | undefined;
+  try { stat = fs.statSync(file); } catch { /* The reader reports unreadable files. */ }
+  const cached = metaCache.get(file);
+  if (stat && cached?.mtimeMs === stat.mtimeMs && cached.size === stat.size) return cached.meta;
+  const remember = (meta: CodexSessionFile | null): CodexSessionFile | null => {
+    if (stat) metaCache.set(file, { mtimeMs: stat.mtimeMs, size: stat.size, meta });
+    return meta;
+  };
   let rec: Record<string, unknown> | null = null;
   forEachJsonlRecord(file, (record) => {
-    if (record["type"] === "session_meta") {
-      rec = record;
-      return false;
-    }
-  });
-  if (!rec) return null;
+    if (record["type"] === "session_meta") rec = record;
+    return false;
+  }, { chunkSize: 64 * 1024 });
+  if (!rec) return remember(null);
   const record = rec as Record<string, unknown>;
   const payload = (record["payload"] ?? {}) as Record<string, unknown>;
-  if (typeof payload["cwd"] !== "string") return null;
-  const subagent = isSubagentSource(payload);
-  const source = payload["source"];
+  if (typeof payload["cwd"] !== "string") return remember(null);
   const ts = typeof record["timestamp"] === "string" ? Date.parse(record["timestamp"] as string) : NaN;
   const rawId = payload["id"] ?? payload["session_id"];
   const historyBase = payload["history_base"] as Record<string, unknown> | undefined;
-  return {
+  return remember({
     file,
     cwd: payload["cwd"] as string,
     sessionId: typeof rawId === "string" ? rawId : null,
     historyBaseEndOrdinal:
       typeof historyBase?.["end_ordinal_exclusive"] === "number"
         ? historyBase["end_ordinal_exclusive"] : null,
-    interactive:
-      !subagent &&
-      payload["originator"] !== "Claude Code" &&
-      (source === undefined ||
-        (typeof source === "string" && source !== "exec" && source !== "mcp")),
-    subagent,
+    ...classifyCodexSessionMeta(payload),
     startedAt: Number.isNaN(ts) ? 0 : ts,
-  };
+  });
 }
 
 function userTextParts(payload: Record<string, unknown>): string[] {
@@ -144,7 +151,10 @@ export function codexHumanInput(record: Record<string, unknown>): { prompt: stri
 }
 
 function parseEvents(meta: CodexSessionFile, options: TimelineLoadOptions): SessionEvent[] {
-  if (isLogFileBefore(meta.file, options.pruneBeforeMs)) return [];
+  if (isLogFileBefore(meta.file, options.pruneBeforeMs)) {
+    if (options.stats) options.stats.prunedFiles++;
+    return [];
+  }
   const events: SessionEvent[] = [];
   // Subagents may replay parent history before their own start.
   const effectiveSince = meta.subagent ? meta.startedAt : -Infinity;
@@ -183,7 +193,7 @@ function scanCodexMetadata(
   baseDir?: CodexSessionBase,
   projectPath?: string,
   includeDescendants = true
-): CodexSessionFile[] {
+): Map<string, CodexSessionFile[]> {
   const seenIds = new Set<string>();
   const files: CodexSessionFile[] = [];
   for (const dir of baseDirs(baseDir)) {
@@ -197,13 +207,18 @@ function scanCodexMetadata(
     }
   }
   // Continuations contain only new records. Use the base thread's source for all segments.
-  return [...groupSegments(files).values()].flatMap((segments) => {
+  const threads = groupSegments(files);
+  for (const [key, segments] of threads) {
     const base = baseSegment(segments);
-    if (projectPath && !belongsToProject(base.cwd, projectPath, includeDescendants)) return [];
-    return segments
+    if (projectPath && !belongsToProject(base.cwd, projectPath, includeDescendants)) {
+      threads.delete(key);
+      continue;
+    }
+    threads.set(key, segments
       .sort((a, b) => (a.historyBaseEndOrdinal ?? -1) - (b.historyBaseEndOrdinal ?? -1))
-      .map((meta) => ({ ...meta, interactive: base.interactive, subagent: base.subagent }));
-  });
+      .map((meta) => ({ ...meta, interactive: base.interactive, subagent: base.subagent })));
+  }
+  return threads;
 }
 
 function groupSegments(files: CodexSessionFile[]): Map<string, CodexSessionFile[]> {
@@ -230,7 +245,7 @@ export function scanCodexSessions(
   includeDescendants = true
 ): ScannedCodexSession[] {
   const scanned: ScannedCodexSession[] = [];
-  for (const segments of groupSegments(scanCodexMetadata(baseDir, projectPath, includeDescendants)).values()) {
+  for (const segments of scanCodexMetadata(baseDir, projectPath, includeDescendants).values()) {
     const meta = baseSegment(segments);
     const events = segments.flatMap((segment) => parseEvents(segment, options))
       .sort((a, b) => a.ts - b.ts);
@@ -271,5 +286,5 @@ export function findCodexSessionFiles(
   baseDir?: CodexSessionBase,
   includeDescendants = true
 ): CodexSessionFile[] {
-  return scanCodexMetadata(baseDir, projectPath, includeDescendants);
+  return [...scanCodexMetadata(baseDir, projectPath, includeDescendants).values()].flat();
 }

@@ -3,8 +3,8 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
 import { spawnSync } from "node:child_process";
-import { PROJECTS_BASE, classifyRecord } from "./core.js";
-import { CODEX_HOME, defaultCodexSessionDirs, codexHumanInput } from "./sources/codex.js";
+import { PROJECTS_BASE, classifyRecord, isClaudeSubagentFile } from "./core.js";
+import { CODEX_HOME, defaultCodexSessionDirs, codexHumanInput, classifyCodexSessionMeta } from "./sources/codex.js";
 import { checkRetention } from "./install.js";
 import { forEachJsonlRecord, unreadableFileCount } from "./jsonl.js";
 import {
@@ -127,7 +127,7 @@ export function collectDoctor(now = Date.now()) {
     if (file.size > fileBudget) sampledFiles++;
     let previousTs: number | null = null;
     let interactive = true;
-    let subagent = file.source === "claude" && file.file.includes(`${path.sep}subagents${path.sep}`);
+    let subagent = file.source === "claude" && isClaudeSubagentFile(file.file, path.join(PROJECTS_BASE, path.relative(PROJECTS_BASE, file.file).split(path.sep)[0]));
     let historyBase = false;
     let pending: { ts: number; kind: string }[] = [];
     forEachJsonlRecord(file.file, (record) => {
@@ -145,8 +145,7 @@ export function collectDoctor(now = Date.now()) {
         if (!KNOWN_ORIGINATORS.has(originator)) increment(originators, originator);
         if (!KNOWN_CODEX_SOURCES.has(source)) increment(codexSources, source);
         if (payload["history_base"] !== undefined) historyBase = true;
-        subagent = source.startsWith("subagent.") || payload["thread_source"] === "subagent" || typeof payload["parent_thread_id"] === "string";
-        interactive = !subagent && payload["originator"] !== "Claude Code" && source !== "exec" && source !== "mcp";
+        ({ subagent, interactive } = classifyCodexSessionMeta(payload));
       }
       const timestamp = record["timestamp"];
       const ts = typeof timestamp === "string" ? Date.parse(timestamp) : NaN;

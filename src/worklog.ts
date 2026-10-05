@@ -5,9 +5,9 @@
  * away_summary texts Claude Code itself wrote (free LLM summaries!).
  */
 import { agentEditedFiles, parseArguments } from "./edits.js";
-import * as path from "node:path";
 import {
   hourKey,
+  isClaudeSubagentFile,
   isHumanPromptSource,
   isMachineGeneratedText,
   claudeProjectFiles,
@@ -80,9 +80,8 @@ export function collectWorklog(
     return b;
   };
 
-  for (const file of claudeProjectFiles(projectDir, projectPath, includeDescendants)) {
-    if (isLogFileBefore(file, sinceMs)) continue;
-    const isSubagent = file.includes(`${path.sep}subagents${path.sep}`);
+  for (const file of claudeProjectFiles(projectDir, projectPath, includeDescendants, { pruneBeforeMs: sinceMs })) {
+    const isSubagent = isClaudeSubagentFile(file, projectDir);
     forEachJsonlRecord(file, (r) => {
       const tsStr = r["timestamp"];
       if (typeof tsStr !== "string") return;

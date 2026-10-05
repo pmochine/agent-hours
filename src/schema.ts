@@ -152,6 +152,6 @@ export const KNOWN_ORIGINATORS = new Set(["(missing)", "Claude Code", "codex_exe
   "codex_work_desktop", // Human desktop front-end.
   "codex_cli_rs", // Codex CLI front-end used interactively.
 ]);
-export const KNOWN_CODEX_SOURCES = new Set(["(missing)", "cli", "exec", "mcp", "vscode", "subagent.spawn", "subagent.other",
-  "subagent.thread_spawn", // Subagent; already treated as machine by isSubagentSource.
+export const KNOWN_CODEX_SOURCES = new Set(["(missing)", "cli", "exec", "mcp", "vscode", "subagent", "subagent.spawn", "subagent.other",
+  "subagent.thread_spawn", // Subagent; already treated as machine by classifyCodexSessionMeta.
 ]);

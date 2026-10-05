@@ -3,8 +3,8 @@ import * as path from "node:path";
 
 const EDIT_TOOLS = new Set(["Edit", "Write", "MultiEdit", "NotebookEdit"]);
 
-export function normalizeEditedPath(file: string, cwd: string): string {
-  return path.resolve(cwd, file).normalize("NFC");
+export function normalizeEditedPath(file: string, cwd?: string): string {
+  return (cwd === undefined ? file : path.resolve(cwd, file)).normalize("NFC");
 }
 
 export function parseArguments(value: unknown): Record<string, unknown> | null {

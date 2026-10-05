@@ -98,7 +98,8 @@ process.stdin.on("end", () => {
   if (process.env.STUB_MODE === "array") return process.stdout.write("[]");
   const result = { [buckets[0].key]: process.env.STUB_TEXT || "Reviewed layout.", OVERALL: "Period reviewed.", UNKNOWN: "Ignore this summary.", ["__proto__"]: "Ignore this too." };
   if (buckets[1]) result[buckets[1].key] = { invalid: "Ignore non-string values." };
-  process.stdout.write(JSON.stringify(result));
+  const reply = JSON.stringify(result);
+  process.stdout.write(process.env.STUB_MODE === "fenced" ? String.fromCharCode(96).repeat(3) + "json\\n" + reply + "\\n" + String.fromCharCode(96).repeat(3) : process.env.STUB_MODE === "prose" ? "Here is the summary:\\n" + reply + "\\nDone." : reply);
 });
 `, { mode: 0o755 });
   try {
@@ -198,7 +199,7 @@ test("CLI clips JSON, cap overview, session tables, all-projects and worklog evi
     assert.equal(overview.status, 0, overview.stderr);
     assert.match(overview.stdout, /1min\s+0\.00h\s+0\.00h/);
     assert.match(overview.stdout, /5min\s+0\.07h\s+0\.07h/);
-    assert.match(overview.stdout, /0\.07h active/);
+    assert.match(overview.stdout, /2026-06-01 10:04 – 2026-06-01 10:04 \|\s+1 events \|\s+0\.07h active/);
     assert.match(overview.stdout, /2026-06-01 \|\s+0\.07h \|\s+1 events/);
     const all = run([...args, "--all-projects", "--json"], env);
     assert.equal(all.status, 0, all.stderr);
@@ -320,6 +321,200 @@ test("CLI lists only overlapping pauses and clips their idle and cap-bonus total
     assert.match(result.stdout, /1 total, 0\.50h idle/);
     assert.match(result.stdout, /Cap-bonus effect: 0min/);
     assert.match(result.stdout, /Top 1 longest pauses/);
-    assert.match(result.stdout, /2026-06-01 09:20 – 2026-06-01 11:00/);
+    assert.match(result.stdout, /… 2026-06-01 10:00 – 2026-06-01 10:29 …  →  30\.0 min/);
+    assert.doesNotMatch(result.stdout, /2026-06-01 09:20|2026-06-01 11:00|1h40m/);
+  });
+});
+
+test("CLI summarizes fenced JSON and JSON surrounded by prose", () => {
+  withClaudeStub((env) => {
+    for (const mode of ["fenced", "prose"]) {
+      const result = run([...SUMMARY_ARGS, "--summarize"], { ...env, STUB_MODE: mode });
+      assert.equal(result.status, 0, result.stderr);
+      assert.equal(result.stderr, "");
+      assert.match(result.stdout, /;Reviewed layout\./);
+      assert.match(result.stdout, /;Period reviewed\./);
+      assert.doesNotMatch(result.stdout, /Ignore|invalid|UNKNOWN/);
+    }
+  });
+});
+
+test("CLI validates quarter-hour fixed offsets within the supported bounds", () => {
+  const message = "--tz-offset must be a multiple of 0.25 hours between -14 and 14.\n";
+  for (const offset of ["0.1", "NaN", "Infinity", "14.25", "-14.25"]) {
+    const result = run([`--tz-offset=${offset}`]);
+    assert.equal(result.status, 1);
+    assert.equal(result.stderr, message);
+  }
+  for (const offset of ["5.75", "-14", "14"]) {
+    const result = run(["--project", "/tmp/proj-current", "--source", "codex", `--tz-offset=${offset}`, "--json"]);
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(JSON.parse(result.stdout).tzOffsetHours, +offset);
+  }
+});
+
+function withReviewLogs(callback) {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "ah-review-"));
+  const claude = path.join(home, ".claude", "projects");
+  const codex = path.join(home, ".codex", "sessions");
+  fs.mkdirSync(claude, { recursive: true });
+  fs.mkdirSync(codex, { recursive: true });
+  const write = (file, records) => {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, records.map((record) => JSON.stringify(record)).join("\n") + "\n");
+    return file;
+  };
+  const env = { HOME: home, CODEX_HOME: path.dirname(codex) };
+  const reviewRun = (args) => run(args, env);
+  try { callback({ claude, codex, write, run: reviewRun }); }
+  finally { fs.rmSync(home, { recursive: true, force: true }); }
+}
+
+const claudePrompt = (timestamp, cwd = "/tmp/review-project") => ({ type: "user", timestamp, cwd, promptSource: "typed", message: { content: "Continue." } });
+const codexPrompt = (timestamp) => ({ type: "response_item", timestamp, payload: { type: "message", role: "user", content: "Continue." } });
+const codexMeta = (id, timestamp) => ({ type: "session_meta", timestamp, payload: { id, cwd: "/tmp/review-project", source: "cli" } });
+
+test("CLI session counts and parallel flags exclude sessions outside the range", () => {
+  withReviewLogs(({ claude, codex, write, run }) => {
+    const dir = path.join(claude, "-tmp-review-project");
+    write(path.join(dir, "september.jsonl"), [claudePrompt("2026-09-05T10:00:00Z"), claudePrompt("2026-09-05T10:05:00Z")]);
+    for (const name of ["october-a", "october-b"]) {
+      write(path.join(dir, name + ".jsonl"), [claudePrompt("2026-10-20T10:00:00Z"), claudePrompt("2026-10-20T10:05:00Z")]);
+    }
+    const args = ["--project", "/tmp/review-project", "--timezone", "UTC", "--until", "2026-09-06"];
+    const json = run([...args, "--json"]);
+    assert.equal(json.status, 0, json.stderr);
+    assert.equal(JSON.parse(json.stdout).sessions, 1);
+    assert.equal(JSON.parse(json.stdout).parallelSessions, false);
+    const table = run([...args, "--by-session"]);
+    assert.equal(table.status, 0, table.stderr);
+    assert.match(table.stdout, /Sessions in range: 1/);
+    assert.match(table.stdout, /september\.jsonl/);
+    assert.doesNotMatch(table.stdout, /PARALLEL|october/);
+    write(path.join(codex, "future.jsonl"), [codexMeta("future", "2026-10-20T10:00:00Z"), codexPrompt("2026-10-20T10:05:00Z")]);
+    const mixed = run(args);
+    assert.equal(mixed.status, 0, mixed.stderr);
+    assert.match(mixed.stdout, /Sessions in range: 1\n/);
+  });
+});
+
+test("CLI overlap checks use session endpoints clipped to the range", () => {
+  withReviewLogs(({ claude, write, run }) => {
+    const dir = path.join(claude, "-tmp-review-project");
+    write(path.join(dir, "a.jsonl"), ["09:00", "10:01", "10:02", "11:00"].map((time) => claudePrompt(`2026-09-05T${time}:00Z`)));
+    write(path.join(dir, "b.jsonl"), ["09:00", "10:03", "10:04", "11:00"].map((time) => claudePrompt(`2026-09-05T${time}:00Z`)));
+    const args = ["--project", "/tmp/review-project", "--timezone", "UTC", "--since", "2026-09-05 10:00", "--until", "2026-09-05 10:05"];
+    const json = run([...args, "--json"]);
+    assert.equal(json.status, 0, json.stderr);
+    assert.equal(JSON.parse(json.stdout).sessions, 2);
+    assert.equal(JSON.parse(json.stdout).parallelSessions, false);
+    const table = run([...args, "--by-session"]);
+    assert.equal(table.status, 0, table.stderr);
+    assert.match(table.stdout, /2026-09-05 10:01 – 2026-09-05 10:02 \|\s+2 events/);
+    assert.match(table.stdout, /2026-09-05 10:03 – 2026-09-05 10:04 \|\s+2 events/);
+  });
+});
+
+test("CLI date-only until includes the last local second before a midnight DST jump", () => {
+  withCodexRecords([codexPrompt("2026-09-06T03:59:30Z"), codexPrompt("2026-09-06T04:00:00Z")], (env) => {
+    const result = run(["--project", "/tmp/interval-project", "--source", "codex", "--timezone", "America/Santiago", "--until", "2026-09-05", "--json"], env);
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(JSON.parse(result.stdout).prompts, 1);
+    assert.equal(JSON.parse(result.stdout).events, 2); // metadata and the 23:59:30 prompt
+    assert.equal(JSON.parse(result.stdout).sessions, 1);
+  });
+});
+
+test("CLI pruning preserves the first loaded prompt reaction tail for both sources", () => {
+  withReviewLogs(({ claude, codex, write, run }) => {
+    for (const source of ["claude", "codex"]) {
+      const dir = source === "claude" ? path.join(claude, "-tmp-review-project") : codex;
+      const old = source === "claude"
+        ? [claudePrompt("2026-09-01T00:00:00Z")]
+        : [codexMeta("old", "2026-09-01T00:00:00Z"), codexPrompt("2026-09-01T00:00:00Z")];
+      const fresh = source === "claude" ? [
+        { type: "assistant", timestamp: "2026-09-03T00:01:00Z", cwd: "/tmp/review-project" },
+        claudePrompt("2026-09-03T00:05:00Z"),
+      ] : [
+        codexMeta("fresh", "2026-09-03T00:01:00Z"),
+        { type: "response_item", timestamp: "2026-09-03T00:01:00Z", payload: { type: "message", role: "assistant" } },
+        codexPrompt("2026-09-03T00:05:00Z"),
+      ];
+      const file = write(path.join(dir, "a.jsonl"), old);
+      write(path.join(dir, "b.jsonl"), fresh);
+      const args = ["--project", "/tmp/review-project", "--source", source, "--timezone", "UTC", "--since", "2026-09-03", "--until", "2026-09-03", "--json"];
+      const baseline = run(args);
+      assert.equal(baseline.status, 0, baseline.stderr);
+      fs.utimesSync(file, new Date("2026-09-01"), new Date("2026-09-01"));
+      const pruned = run(args);
+      assert.equal(pruned.status, 0, pruned.stderr);
+      assert.equal(JSON.parse(pruned.stdout).handsOnHours, JSON.parse(baseline.stdout).handsOnHours);
+      assert.equal(JSON.parse(pruned.stdout).handsOnHours, 0.07);
+      // JSON cap variants, human split variants, worklogs, and all-project rows share openStart.
+      assert.equal(JSON.parse(pruned.stdout).capRange["5"].attentionHours, 0.07);
+      const all = run([...args, "--all-projects"]);
+      assert.equal(all.status, 0, all.stderr);
+      assert.equal(JSON.parse(all.stdout).projects[0].attentionHours, 0.07);
+      const split = run([...args.slice(0, -1), "--split", "--worklog", "--csv"]);
+      assert.equal(split.status, 0, split.stderr);
+      assert.match(split.stdout, /4\.0;0\.0;0\.0;/);
+    }
+  });
+});
+
+test("CLI all-projects lastActivity uses the latest event crediting an otherwise empty range", () => {
+  withCodexRecords(["2026-09-01T10:00:00Z", "2026-09-04T23:59:00Z", "2026-09-06T10:00:00Z"].map(codexPrompt), (env) => {
+    const result = run(["--all-projects", "--source", "codex", "--timezone", "UTC", "--since", "2026-09-05", "--until", "2026-09-05", "--json"], env);
+    assert.equal(result.status, 0, result.stderr);
+    const row = JSON.parse(result.stdout).projects[0];
+    assert.equal(row.events, 0);
+    assert.equal(row.totalHours, 0.15);
+    assert.equal(row.lastActivity, "2026-09-04");
+  });
+});
+
+test("CLI all-projects separates Claude hash collisions and keeps subagents with their parent", () => {
+  withReviewLogs(({ claude, write, run }) => {
+    const dir = path.join(claude, "-tmp-a-b");
+    for (const [name, cwd, childCwd] of [["a", "/tmp/a-b", "/tmp/a/b"], ["b", "/tmp/a/b", "/tmp/a-b"]]) {
+      write(path.join(dir, name + ".jsonl"), [claudePrompt("2026-09-05T10:00:00Z", cwd), claudePrompt("2026-09-05T10:01:00Z", cwd)]);
+      write(path.join(dir, name, "subagents", "agent.jsonl"), [claudePrompt("2026-09-05T10:02:00Z", childCwd)]);
+    }
+    const args = ["--all-projects", "--source", "claude", "--timezone", "UTC", "--json"];
+    const result = run(args);
+    assert.equal(result.status, 0, result.stderr);
+    const rows = JSON.parse(result.stdout).projects;
+    assert.deepEqual(rows.map((row) => row.project).sort(), ["/tmp/a-b", "/tmp/a/b"]);
+    assert.ok(rows.every((row) => row.events === 3 && row.totalHours === 0.03));
+    write(path.join(dir, "legacy.jsonl"), [{ type: "assistant", timestamp: "2026-09-05T10:00:00Z" }]);
+    const legacyChild = claudePrompt("2026-09-05T10:01:00Z", "/tmp/a/b");
+    write(path.join(dir, "legacy", "subagents", "agent.jsonl"), [legacyChild]);
+    const withLegacy = run(args);
+    assert.equal(withLegacy.status, 0, withLegacy.stderr);
+    assert.deepEqual(JSON.parse(withLegacy.stdout).projects.map((row) => row.project).sort(), ["-tmp-a-b", "/tmp/a-b", "/tmp/a/b"]);
+    assert.equal(JSON.parse(withLegacy.stdout).projects.find((row) => row.project === "-tmp-a-b").events, 2);
+  });
+});
+
+test("CLI timed until excludes an event exactly at the inclusive since boundary", () => {
+  withCodexRecords([
+    { ...codexPrompt("2026-09-05T10:00:00Z"), payload: { type: "message", role: "user", content: "Earlier." } },
+    { ...codexPrompt("2026-09-05T10:05:00Z"), payload: { type: "message", role: "user", content: "Boundary." } },
+  ], (env) => {
+    const args = ["--project", "/tmp/interval-project", "--source", "codex", "--timezone", "UTC", "--json"];
+    const since = run([...args, "--since", "2026-09-05 10:05"], env);
+    const until = run([...args, "--until", "2026-09-05 10:05"], env);
+    assert.equal(since.status, 0, since.stderr);
+    assert.equal(until.status, 0, until.stderr);
+    assert.equal(JSON.parse(since.stdout).prompts, 1);
+    assert.equal(JSON.parse(until.stdout).prompts, 1);
+    assert.equal(JSON.parse(since.stdout).events, 1);
+    assert.equal(JSON.parse(until.stdout).events, 2); // metadata and the earlier prompt
+    const sinceLog = run([...args, "--since", "2026-09-05 10:05", "--worklog-json"], env);
+    const untilLog = run([...args, "--until", "2026-09-05 10:05", "--worklog-json"], env);
+    assert.equal(sinceLog.status, 0, sinceLog.stderr);
+    assert.equal(untilLog.status, 0, untilLog.stderr);
+    assert.deepEqual(JSON.parse(sinceLog.stdout).hours.flatMap((hour) => hour.prompts), ["Boundary."]);
+    assert.deepEqual(JSON.parse(untilLog.stdout).hours.flatMap((hour) => hour.prompts), ["Earlier."]);
   });
 });

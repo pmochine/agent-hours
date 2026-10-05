@@ -6,6 +6,15 @@ All notable changes are documented here, following [Keep a Changelog](https://ke
 
 ### Fixed
 
+- Session counts, parallel warnings, session tables, and pause details now reflect the requested range.
+- Date-only `--until` includes the whole day across midnight DST jumps; timed `--until` is exclusive.
+- Pruning a previous prompt's file preserves the first loaded reaction tail and watch weight.
+- `--summarize` accepts fenced JSON replies with surrounding text.
+- `--all-projects` separates Claude hash collisions by each file's canonical cwd and reports the latest activity before the range end.
+- Doctor shares Codex source classification and recognizes bare subagent sources.
+- Claude subagent classification uses the path relative to the project directory; relative edits without session cwd use the requested project path or stay relative.
+- Codex metadata is accepted only in the first object record, preventing inherited metadata from creating sessions.
+
 - External edited-file notices only prove human presence when no other session, including a subagent, edited the same normalized path in the previous 30 minutes.
 - Totals drop where Claude away summaries and Codex thread settings previously padded pauses. Away summaries remain worklog evidence.
 - Codex long threads now include continuation segments once, including archived copies; Claude workflow subagents now count as machine work.
@@ -14,6 +23,7 @@ All notable changes are documented here, following [Keep a Changelog](https://ke
 
 ### Changed
 
+- `--tz-offset` must be a finite multiple of 0.25 hours between -14 and 14.
 - **Breaking:** CSV headers are English by default; use `--lang de` for the previous headers.
 - Credited time sits immediately after an event; hourly worklog CSV minutes use one decimal.
 - JSONL logs are streamed and `--since` prunes old files by modification time while retaining Codex base metadata for continuations.
