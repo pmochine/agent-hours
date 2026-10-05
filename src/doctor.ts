@@ -1,6 +1,7 @@
 /** Read-only diagnostics. Never retain or print prompts, content, or project paths. */
 import * as fs from "node:fs";
 import * as path from "node:path";
+import * as os from "node:os";
 import { spawnSync } from "node:child_process";
 import { PROJECTS_BASE, classifyRecord } from "./core.js";
 import { CODEX_HOME, defaultCodexSessionDirs, codexHumanInput } from "./sources/codex.js";
@@ -13,6 +14,8 @@ import {
 
 const DAY = 86400000;
 const READ_LIMIT = 400 * 1024 * 1024;
+const FILE_READ_LIMIT = 8 * 1024 * 1024;
+const MIN_FILE_SAMPLE = 256 * 1024;
 type Source = "claude" | "codex";
 type Counts = Map<string, number>;
 interface LogFile { file: string; source: Source; size: number; mtimeMs: number }
@@ -23,6 +26,20 @@ function increment(counts: Counts, key: string): void {
 }
 function counted(counts: Counts): { kind: string; count: number }[] {
   return [...counts].map(([kind, count]) => ({ kind, count })).sort((a, b) => b.count - a.count || (a.kind < b.kind ? -1 : a.kind > b.kind ? 1 : 0));
+}
+function displayPath(directory: string): string {
+  const home = os.homedir();
+  return directory === home ? "~" : directory.startsWith(home + path.sep)
+    ? "~" + directory.slice(home.length) : directory;
+}
+function passiveKind(record: Record<string, unknown>, source: Source, kind: string): string {
+  if (source === "claude" && record["type"] === "queue-operation") {
+    const operation = typeof record["operation"] === "string" ? record["operation"] : "(missing)";
+    const content = record["content"];
+    const notification = typeof content === "string" && content.startsWith("<task-notification>");
+    return `claude:queue-operation|${operation}|${notification ? "task-notification" : "other"}`;
+  }
+  return `${source}:${kind}`;
 }
 function binaryVersion(binary: string): string | null {
   try {
@@ -37,7 +54,7 @@ export function collectDoctor(now = Date.now()) {
   let nestedSubagentDirectories = 0;
   let inventoryFailures = 0;
   const inventory = (directory: string, source: Source): SourceInfo => {
-    const info: SourceInfo = { directory, exists: fs.existsSync(directory), files: 0, bytes: 0 };
+    const info: SourceInfo = { directory: displayPath(directory), exists: fs.existsSync(directory), files: 0, bytes: 0 };
     if (source === "claude") info.projectDirectories = 0;
     const walk = (dir: string): void => {
       let entries: fs.Dirent[];
@@ -78,7 +95,7 @@ export function collectDoctor(now = Date.now()) {
   const [sessionsDir, archivedDir] = defaultCodexSessionDirs();
   const sources = {
     claude: inventory(PROJECTS_BASE, "claude"),
-    codexHome: CODEX_HOME,
+    codexHome: displayPath(CODEX_HOME),
     codexSessions: inventory(sessionsDir, "codex"),
     codexArchivedSessions: inventory(archivedDir, "codex"),
     versions: { claude: binaryVersion("claude"), codex: binaryVersion("codex") },
@@ -96,14 +113,18 @@ export function collectDoctor(now = Date.now()) {
   const kinds = new Map<string, number>();
   const passive = new Map<string, number>();
   const recent = files.filter((file) => file.mtimeMs >= now - 14 * DAY).sort((a, b) => b.mtimeMs - a.mtimeMs);
+  const fileSampleBytes = Math.max(MIN_FILE_SAMPLE, Math.min(FILE_READ_LIMIT, Math.floor(READ_LIMIT / Math.max(1, recent.length))));
   let bytesRead = 0;
   let filesScanned = 0;
+  let sampledFiles = 0;
   let historyBaseFiles = 0;
   const unreadableBefore = unreadableFileCount;
   for (const file of recent) {
     if (bytesRead >= READ_LIMIT) break;
     filesScanned++;
     const bytesBefore = bytesRead;
+    const fileBudget = Math.min(fileSampleBytes, READ_LIMIT - bytesRead);
+    if (file.size > fileBudget) sampledFiles++;
     let previousTs: number | null = null;
     let interactive = true;
     let subagent = file.source === "claude" && file.file.includes(`${path.sep}subagents${path.sep}`);
@@ -138,9 +159,9 @@ export function collectDoctor(now = Date.now()) {
         return !(human && ts >= candidate.ts);
       });
       // A prompt is itself human input at the end of the gap, not passive.
-      if (!human && previousTs !== null && ts - previousTs > 10 * 60000) pending.push({ ts, kind: labeledKind });
+      if (!human && previousTs !== null && ts - previousTs > 10 * 60000) pending.push({ ts, kind: passiveKind(record, file.source, kind) });
       previousTs = ts;
-    }, { maxBytes: READ_LIMIT - bytesRead, onBytesRead: (size) => { bytesRead += size; } });
+    }, { maxBytes: fileBudget, onBytesRead: (size) => { bytesRead += size; } });
     // Only complete files establish the absence of a later human prompt.
     if (bytesRead - bytesBefore >= file.size) {
       for (const candidate of pending) increment(passive, candidate.kind);
@@ -150,7 +171,7 @@ export function collectDoctor(now = Date.now()) {
   const unreadableFiles = unreadableFileCount - unreadableBefore;
   const scan = {
     days: 14, recentFiles: recent.length, filesScanned, bytesRead,
-    readLimitBytes: READ_LIMIT, limited: bytesRead >= READ_LIMIT,
+    readLimitBytes: READ_LIMIT, fileReadLimitBytes: fileSampleBytes, sampledFiles, limited: bytesRead >= READ_LIMIT,
     kinds: counted(kinds), unknownClaudeKinds: counted(unknownClaude), unknownCodexKinds: counted(unknownCodex),
     unknownPromptSources: counted(promptSources), unknownOriginators: counted(originators), unknownSources: counted(codexSources),
   };
@@ -178,7 +199,7 @@ export function formatDoctor(report: ReturnType<typeof collectDoctor>): string {
   lines.push(`  CODEX_HOME: ${report.sources.codexHome}`);
   lines.push(`  Versions: claude=${report.sources.versions.claude ?? "unavailable"}; codex=${report.sources.versions.codex ?? "unavailable"}`);
   lines.push(`Retention: cleanupPeriodDays=${report.retention.cleanupPeriodDays}; oldest Claude file=${report.retention.oldestAgeDays?.toFixed(1) ?? "none"} days (mtime)`);
-  lines.push(`Schema canary: ${report.scan.filesScanned}/${report.scan.recentFiles} recent files; ${report.scan.bytesRead} bytes read; last ${report.scan.days} days${report.scan.limited ? "; stopped at 400 MB limit (partial scan)" : ""}`);
+  lines.push(`Schema canary: scanned ${report.scan.filesScanned}/${report.scan.recentFiles} files; ${report.scan.bytesRead} bytes read; last ${report.scan.days} days; first ${report.scan.fileReadLimitBytes} bytes per file; ${report.scan.sampledFiles} sampled files${report.scan.limited ? "; stopped at 400 MB limit (partial scan)" : ""}`);
   const section = (title: string, values: { kind: string; count: number }[]) => {
     lines.push(`${title}: ${values.length ? values.length + " kinds/values" : "none"}`);
     for (const value of values) lines.push(`  ${JSON.stringify(value.kind)}: ${value.count}`);

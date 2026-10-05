@@ -143,3 +143,125 @@ test("doctor reports unreadable streaming files inside JSON without a second std
     assert.equal(report.status, "doctor: 1 warnings");
   });
 });
+
+test("doctor hides HOME in human-readable and JSON paths", () => {
+  fixture(({ home, run }) => {
+    for (const args of [[], ["--json"]]) {
+      const result = run(args);
+      assert.equal(result.status, 0, result.stderr);
+      assert.ok(!result.stdout.includes(home), result.stdout);
+      assert.ok(!result.stderr.includes(home), result.stderr);
+      if (args.length) {
+        const report = JSON.parse(result.stdout);
+        assert.equal(report.sources.claude.directory, "~/.claude/projects");
+        assert.equal(report.sources.codexHome, "~/.codex");
+        assert.equal(report.sources.codexSessions.directory, "~/.codex/sessions");
+        assert.equal(report.sources.codexArchivedSessions.directory, "~/.codex/archived_sessions");
+      } else {
+        assert.match(result.stdout, /Claude projects: ~\/\.claude\/projects/);
+        assert.match(result.stdout, /CODEX_HOME: ~\/\.codex/);
+      }
+    }
+    const exactHome = JSON.parse(run(["--json"], { CODEX_HOME: home }).stdout);
+    assert.equal(exactHome.sources.codexHome, "~");
+  });
+});
+
+test("doctor samples the first 8 MB on complete lines and continues to older files", () => {
+  fixture(({ project, write, run }) => {
+    const limit = 8 * 1024 * 1024;
+    const file = path.join(project, "large.jsonl");
+    const first = JSON.stringify({ type: "first_sample_kind", timestamp: stamp(1) }) + "\n";
+    const crossing = JSON.stringify({ type: "crossing_sample_kind", timestamp: stamp(2), content: "x".repeat(limit) }) + "\n";
+    const after = JSON.stringify({ type: "after_sample_kind", timestamp: stamp(3) }) + "\n";
+    fs.writeFileSync(file, first + crossing + after);
+    write(path.join(project, "older.jsonl"), [{ type: "older_sample_kind", timestamp: stamp(1) }]);
+    const older = new Date(Date.now() - 60000);
+    fs.utimesSync(path.join(project, "older.jsonl"), older, older);
+    const report = JSON.parse(run(["--json"]).stdout);
+    assert.equal(report.scan.filesScanned, 4);
+    assert.equal(report.scan.recentFiles, 4);
+    assert.equal(report.scan.sampledFiles, 1);
+    assert.equal(report.scan.fileReadLimitBytes, limit);
+    assert.equal(report.scan.limited, false);
+    assert.deepEqual(report.scan.unknownClaudeKinds, [
+      { kind: "first_sample_kind|||", count: 1 },
+      { kind: "older_sample_kind|||", count: 1 },
+    ]);
+    const otherBytes = fs.statSync(path.join(project, "older.jsonl")).size + fs.statSync(path.join(project, "session.jsonl")).size;
+    assert.equal(report.scan.bytesRead, limit + otherBytes + report.sources.codexSessions.bytes);
+  });
+});
+
+test("doctor distributes the budget across every recent file within the total cap", () => {
+  fixture(({ project, sessions, run }) => {
+    const limit = 8 * 1024 * 1024;
+    const newest = Date.now();
+    for (let i = 0; i < 51; i++) {
+      const file = path.join(project, `sample-${i}.jsonl`);
+      fs.writeFileSync(file, JSON.stringify({ type: `sample_${i}`, timestamp: stamp(1) }) + "\n");
+      // Sparse padding avoids allocating 400 MB of fixture content.
+      fs.truncateSync(file, limit + 1);
+      const modified = new Date(newest - i * 1000);
+      fs.utimesSync(file, modified, modified);
+    }
+    const old = new Date(newest - 60000);
+    fs.utimesSync(path.join(project, "session.jsonl"), old, old);
+    fs.utimesSync(path.join(sessions, "rollout.jsonl"), old, old);
+    const result = run(["--json"]);
+    assert.equal(result.status, 0, result.stderr);
+    const report = JSON.parse(result.stdout);
+    const sampleBytes = Math.floor(400 * 1024 * 1024 / 53);
+    assert.equal(report.scan.fileReadLimitBytes, sampleBytes);
+    assert.equal(report.scan.bytesRead, 51 * sampleBytes + report.sources.codexSessions.bytes + fs.statSync(path.join(project, "session.jsonl")).size);
+    assert.ok(report.scan.bytesRead <= report.scan.readLimitBytes);
+    assert.equal(report.scan.limited, false);
+    assert.equal(report.scan.filesScanned, 53);
+    assert.equal(report.scan.recentFiles, 53);
+    assert.equal(report.scan.sampledFiles, 51);
+    assert.ok(report.scan.unknownClaudeKinds.some(({ kind }) => kind === "sample_0|||"));
+    assert.ok(report.scan.unknownClaudeKinds.some(({ kind }) => kind === "sample_49|||"));
+    assert.ok(report.scan.unknownClaudeKinds.some(({ kind }) => kind === "sample_50|||"));
+  });
+});
+
+test("doctor distinguishes passive queue operations and human enqueues cancel candidates", () => {
+  fixture(({ project, write, run }) => {
+    write(path.join(project, "queue.jsonl"), [
+      { type: "assistant", timestamp: stamp(0) },
+      { type: "queue-operation", operation: "enqueue", timestamp: stamp(20), content: "<task-notification>Private task.</task-notification>" },
+      { type: "assistant", timestamp: stamp(23) },
+      { type: "queue-operation", operation: "dequeue", timestamp: stamp(40), content: "Private queued content." },
+      { type: "assistant", timestamp: stamp(43) },
+      { type: "queue-operation", operation: "enqueue", timestamp: stamp(60), content: "<task-notification>Private second task.</task-notification>" },
+      { type: "queue-operation", operation: "enqueue", timestamp: stamp(61), content: "Private human input." },
+      { type: "assistant", timestamp: stamp(64) },
+      { type: "queue-operation", operation: "enqueue", timestamp: stamp(80), content: "Private human input after a gap." },
+      { type: "assistant", timestamp: stamp(83) },
+    ]);
+    const result = run(["--json"]);
+    assert.equal(result.status, 0, result.stderr);
+    const report = JSON.parse(result.stdout);
+    assert.deepEqual(report.passiveCandidates, [
+      { kind: "claude:queue-operation|dequeue|other", count: 1 },
+      { kind: "claude:queue-operation|enqueue|task-notification", count: 1 },
+    ]);
+    assert.deepEqual(report.scan.unknownClaudeKinds, []);
+    assert.doesNotMatch(result.stdout, /Private/);
+  });
+});
+
+test("doctor recognizes only the three approved canary additions", () => {
+  fixture(({ project, sessions, write, run }) => {
+    write(path.join(project, "scheduled.jsonl"), [{ type: "system", subtype: "scheduled_task_fire", timestamp: stamp(2) }]);
+    write(path.join(sessions, "desktop.jsonl"), [{ type: "session_meta", timestamp: stamp(2), payload: { id: "desktop", cwd: "/tmp/doctor-project", source: "cli", originator: "codex_work_desktop" } }]);
+    write(path.join(sessions, "subagent.jsonl"), [{ type: "session_meta", timestamp: stamp(2), payload: { id: "subagent", cwd: "/tmp/doctor-project", source: { subagent: { thread_spawn: {} } }, originator: "codex-tui" } }]);
+    const result = run(["--json"]);
+    assert.equal(result.status, 0, result.stderr);
+    const report = JSON.parse(result.stdout);
+    assert.equal(report.status, "doctor: OK");
+    assert.deepEqual(report.scan.unknownClaudeKinds, []);
+    assert.deepEqual(report.scan.unknownOriginators, []);
+    assert.deepEqual(report.scan.unknownSources, []);
+  });
+});

@@ -96,6 +96,7 @@ export const KNOWN_CLAUDE_KINDS = new Set([
   "system|compact_boundary||",
   "system|informational||",
   "system|local_command||",
+  "system|scheduled_task_fire||", // Scheduled-task trigger; machine bookkeeping.
   "system|stop_hook_summary||",
   "system|turn_duration||",
 ]);
@@ -142,5 +143,9 @@ export const KNOWN_CODEX_KINDS = new Set([
 // Handled human and nonhuman prompt sources; observed: typed, system, queued.
 export const KNOWN_PROMPT_SOURCES = new Set(["typed", "suggestion_accepted", "system", "queued", "sdk", "hook"]);
 // Handled session routing plus observed bookkeeping originators and source shapes.
-export const KNOWN_ORIGINATORS = new Set(["(missing)", "Claude Code", "codex_exec", "Codex Desktop", "codex-tui"]);
-export const KNOWN_CODEX_SOURCES = new Set(["(missing)", "cli", "exec", "mcp", "vscode", "subagent.spawn", "subagent.other"]);
+export const KNOWN_ORIGINATORS = new Set(["(missing)", "Claude Code", "codex_exec", "Codex Desktop", "codex-tui",
+  "codex_work_desktop", // Human desktop front-end.
+]);
+export const KNOWN_CODEX_SOURCES = new Set(["(missing)", "cli", "exec", "mcp", "vscode", "subagent.spawn", "subagent.other",
+  "subagent.thread_spawn", // Subagent; already treated as machine by isSubagentSource.
+]);
