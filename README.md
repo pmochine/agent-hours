@@ -78,6 +78,8 @@ From then on, questions like *"What did I work on this week?"* or *"Export a CSV
 
 ```bash
 npx agent-hours install [claude|codex|all] # install the skill for selected agents
+npx agent-hours doctor             # check sources, retention, and schema
+npx agent-hours doctor --json      # the same diagnostics as JSON
 npx agent-hours                    # current project, hours at several idle caps
 npx agent-hours --split            # direct interaction / supervised / AI-autonomous
 npx agent-hours --by-day --split   # per-day table with split
@@ -106,19 +108,23 @@ npx agent-hours --pauses                   # longest gaps > cap
 npx agent-hours --pauses --top-pauses <n>  # number of pauses to list
 ```
 
+When hours look wrong or after an agent update, run `agent-hours doctor`. It reports source sizes, retention risk, unfamiliar record kinds, and possible passive records without printing prompts, log content, or project paths. The read-only canary checks files modified in the last 14 days, stops at 400 MB, and exits successfully even with warnings.
+
 ## Methodology
 
 **Idle-cap timing** sums the gaps between consecutive events and caps each gap at a configurable limit. This is a common activity-log technique, but it is still a model rather than a stopwatch. The output shows several caps (1/2/3/5/10/15) plus a *strict* column (pause > cap counts zero), so you can see the sensitivity of the result.
 
+Credited time is placed immediately after the earlier event, up to the next event or the cap. Date ranges and hourly buckets clip those intervals; adjacent ranges add up to the whole period. The repeated daylight-saving hour is shown separately as `HH:00 (repeated)`. Hourly worklog CSV minutes have one decimal.
+
 **The three-state split** answers the question a binary human/AI split gets wrong — *was the human actually there while the agent worked?*
 
 - **Direct interaction** — capped reaction tails between the latest assistant output in the same session and your next prompt. If two prompts arrive without an answer between them, the earlier prompt is the fallback anchor. This estimates time spent reading, thinking, or typing; it does not prove continuous work throughout the tail.
-- **Supervised** — the agent-working part of each prompt window, weighted by same-session watch evidence: you reacted within 30 s afterwards (you were watching) ⇒ 100 %, within 5 min ⇒ 50 %, slower ⇒ 0 %. Hard presence proof in that session — you typed a queued message mid-turn, or edited a file in your editor while the agent ran — forces 100 %.
+- **Supervised** — the agent-working part of each prompt window, weighted by same-session watch evidence: you reacted within 30 s afterwards (you were watching) ⇒ 100 %, within 5 min ⇒ 50 %, slower ⇒ 0 %. Hard presence proof in that session — you typed a queued message mid-turn, or an external file change was noticed while the agent ran — forces 100 %. An edited-file notice only qualifies if no other session (including a subagent) edited the same normalized path in the preceding 30 minutes.
 - **AI autonomous** — the rest of agent runtime.
 
 What you bill is your decision; the tool gives you the evidence and the band.
 
-Classification details verified against current and legacy logs: scheduled-task, SDK, hook, command-envelope, and task-notification records are filtered out; queued messages are credited at the moment you *typed* them; compact-continuation summaries don't count; and Claude/Codex subagent plus Codex `exec` and `mcp` sessions count entirely as machine work. Multipart Codex messages keep their human text while dropping injected context blocks.
+Classification details verified against current and legacy logs: scheduled-task, SDK, hook, command-envelope, and task-notification records are filtered out; queued messages are credited at the moment you *typed* them; compact-continuation summaries don't count; and Claude/Codex subagent plus Codex `exec` and `mcp` sessions count entirely as machine work. Multipart Codex messages keep their human text while dropping injected context blocks. Codex voice input and question replies, plus Claude `AskUserQuestion` answers, count as human input. Claude `away_summary` and Codex `thread_settings_applied` are excluded from timing: they can arrive after departure and pad pauses. Away summaries remain available as worklog evidence.
 
 ## Sources
 
@@ -128,9 +134,11 @@ Classification details verified against current and legacy logs: scheduled-task,
 | Codex CLI | ✅ | `$CODEX_HOME/sessions/**.jsonl` + `$CODEX_HOME/archived_sessions/**.jsonl` (default home: `~/.codex`, matched via `cwd`, deduplicated by session ID and continuation segment) |
 | Gemini CLI, opencode, Cursor, Aider | planned | see adapter notes below |
 
-Adapter contract: `{ts, kind: prompt|work, presence, reactionAnchor}` events in `src/sources/`, plus worklog extraction in `src/worklog.ts` and wiring in `src/cli.ts`. The Claude Code adapter currently lives in `src/core.ts`; adapters return events inside `NamedSession[]`, and merging attaches session identity. PRs welcome.
+Adapter contract: `{ts, kind: prompt|work, presence, reactionAnchor, editedPath?, agentEdits?}` events in `src/sources/`, plus worklog extraction in `src/worklog.ts` and wiring in `src/cli.ts`. The Claude Code adapter currently lives in `src/core.ts`; adapters return events inside `NamedSession[]`, and merging attaches session identity. PRs welcome.
 
-Sessions started in subdirectories of the project are included for both Claude and Codex.
+Sessions started in subdirectories of the project are included for both Claude and Codex. Claude workflow subagents below `subagents/workflows/wf_*/` count as machine work. Codex long threads can span continuation files (`history_base`); unique segments merge using the base thread’s classification, and archived copies count once.
+
+Logs are read as streams, so large transcripts do not need to fit in memory. `--since` skips event bodies in files whose modification times predate its context window, speeding up recent reports; old Codex base metadata is still read to classify continuations. Doctor flags schema drift and unreadable or unsupported files before you rely on a report.
 
 ## Retroactive use & log retention
 
@@ -152,12 +160,15 @@ Rule of thumb: run exports when you invoice and archive the CSV/JSON next to the
 
 ## Roadmap
 
-- **Rates & invoice math** — `--rate 90 --currency EUR`: money columns, plus a three-anchor pricing suggestion (AI-hours floor / senior-equivalent / market).
+- **Manual entries** — calls and research that agent logs cannot see.
+- **Client profiles** — several repositories under one rate.
+- **`--rate`** — money columns for invoice exports.
+- **`--by-week` / `--by-month`** — grouping for retainer billing.
+- **“Billed until” cutoff** — start the next invoice where the previous one ended.
+- **Reproducible invoice snapshot** — version, parameters, and input fingerprints.
 - **HTML report** — one printable file as the invoice attachment.
-- **Git triangulation** — `--git`: inter-commit hours as a cross-check column.
-- **`--by-week` / `--by-month`** grouping for retainer billing.
-- **Retention guard** — warn when logs approach cleanup age; `agent-hours archive` to snapshot them.
 - **More agents** — Gemini CLI, opencode, Cursor, Aider.
+- **Git triangulation** — `--git`: inter-commit hours as a cross-check column.
 - **Optional live precision** — opt-in macOS idle-time sampler to separate "watching" from "AFK" with hardware truth.
 
 ## Verification

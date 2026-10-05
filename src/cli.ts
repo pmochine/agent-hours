@@ -7,6 +7,7 @@
  * Data source: local Claude and Codex JSONL transcripts (retroactive, zero
  * setup — nothing leaves your machine unless --summarize is requested).
  */
+import { collectDoctor, formatDoctor } from "./doctor.js";
 import { parseArgs } from "node:util";
 import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
@@ -60,6 +61,8 @@ import {
   setRetention,
 } from "./install.js";
 
+let doctorCommand = false;
+
 const HELP = `agent-hours — billable hours from coding-agent session logs
 
 Usage:
@@ -67,6 +70,7 @@ Usage:
                                      drops a skill so you can just ask
                                      "what did I work on this week?", and
                                      offers to raise Claude's log retention
+  npx agent-hours doctor             inspect sources, retention, and schema (or --json)
   npx agent-hours                    current project, cap overview
   npx agent-hours --split            direct interaction / supervised / AI-autonomous
   npx agent-hours --by-day --split   per-day table with split
@@ -251,6 +255,14 @@ async function main(): Promise<void> {
 
   if (args.lang !== "en" && args.lang !== "de") fail("--lang must be en or de.");
   const lang: CsvLanguage = args.lang;
+
+  if (positionals[0] === "doctor") {
+    if (positionals.length > 1) fail("Usage: agent-hours doctor [--json]");
+    doctorCommand = true;
+    const report = collectDoctor();
+    console.log(args.json ? JSON.stringify(report, null, 2) : formatDoctor(report));
+    return;
+  }
 
   if (positionals[0] === "install") {
     const target = (positionals[1] ?? "all") as "claude" | "codex" | "all";
@@ -1036,6 +1048,6 @@ function runAllProjects(
 }
 
 process.on("exit", () => {
-  if (unreadableFileCount > 0) console.error(`warning: ${unreadableFileCount} log files could not be read`);
+  if (!doctorCommand && unreadableFileCount > 0) console.error(`warning: ${unreadableFileCount} log files could not be read`);
 });
 main().catch((e) => fail((e as Error).message));

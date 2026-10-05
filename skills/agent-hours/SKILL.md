@@ -21,6 +21,7 @@ agent-hours --worklog --csv                 # per-hour variant
 agent-hours --json --since 2026-06-01 --until 2026-06-30
 agent-hours --all-projects --source auto --split
 agent-hours --source codex --timezone Europe/Berlin --worklog-json
+agent-hours doctor                         # source, retention, and schema diagnostics
 ```
 
 ## How to answer
@@ -42,13 +43,23 @@ agent-hours --source codex --timezone Europe/Berlin --worklog-json
 
 ## Notes
 
+- When hours look wrong or after an agent update, run `agent-hours doctor`
+  (or `agent-hours doctor --json`). It is read-only and reports counts and
+  schema names, never prompts, log content, or project paths.
 - `--source auto` merges Claude Code + Codex into ONE timeline; parallel
   agents and agent-launched agents do not double-count wall-clock time.
 - Codex reads both active `sessions` and `archived_sessions` from
-  `CODEX_HOME` (default `~/.codex`) and deduplicates session IDs.
+  `CODEX_HOME` (default `~/.codex`) and deduplicates thread IDs and
+  continuation segments.
+- Voice input, question replies, and Claude AskUserQuestion answers count as
+  human input. Away summaries and thread settings do not add timing events.
+- External edited-file notices prove presence only if no other session,
+  including subagents, edited the same normalized path in the previous 30 min.
 - Claude Code prunes logs after cleanupPeriodDays (default 30) — if a range
   looks empty, say so and recommend raising it in ~/.claude/settings.json.
 - Local date ranges and buckets use the system IANA timezone by default. Pass
   `--timezone Europe/Berlin` when a report must use a specific billing zone.
-- Idle-cap methodology: gaps between events capped at 10 min (configurable
-  via --cap/--prompt-cap).
+- Credited time sits right after an event, capped at 10 min (configurable
+  via --cap/--prompt-cap). Ranges and hours clip intervals; adjacent ranges add
+  up. The repeated DST hour has its own "HH:00 (repeated)" bucket. Hourly CSV
+  minutes have one decimal. Streaming and mtime pruning speed up --since.

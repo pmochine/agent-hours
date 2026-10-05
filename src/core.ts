@@ -5,6 +5,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
+import { agentEditedFiles, normalizeEditedPath } from "./edits.js";
 import { forEachJsonlRecord, isLogFileBefore } from "./jsonl.js";
 
 export type EventKind = "prompt" | "work";
@@ -26,6 +27,10 @@ export interface SessionEvent {
   reactionAnchor?: boolean;
   /** A human enqueue typed while the agent was running. */
   midTurn?: boolean;
+  /** External change noticed by Claude, normalized against the session cwd. */
+  editedPath?: string;
+  /** Files edited by this session at this event, normalized against its cwd. */
+  agentEdits?: string[];
 }
 
 export interface TimelineLoadOptions {
@@ -233,7 +238,7 @@ export function claudeQuestionAnswers(record: Record<string, unknown>): Record<s
  *   `<task-notification>` payloads are system traffic.
  * - `isSidechain` = subagent transcript — machine, never a human prompt.
  * - `isCompactSummary` = synthetic continuation prompt, not human.
- * - `attachment` edited_text_file = user edited a file in an external editor
+ * - `attachment` edited_text_file = external change, subject to edit attribution
  *   (presence proof, not a prompt).
  * - Legacy logs without `promptSource` fall back to the shape heuristic:
  *   type=user, not isMeta, content is a string or has text but no tool_result.
@@ -307,20 +312,27 @@ export function loadSessionEvents(
 ): SessionEvent[] {
   if (isLogFileBefore(jsonlPath, options.pruneBeforeMs)) return [];
   const events: SessionEvent[] = [];
+  let cwd = cwdFromJsonl(jsonlPath) ?? process.cwd();
   forEachJsonlRecord(jsonlPath, (record) => {
+    if (typeof record["cwd"] === "string") cwd = record["cwd"];
     const tsStr = record["timestamp"];
     if (typeof tsStr !== "string") return;
     const ts = Date.parse(tsStr);
     if (Number.isNaN(ts)) return;
     // Written after the last record, when the person has left.
     if (record["type"] === "system" && record["subtype"] === "away_summary") return;
+    const agentEdits = agentEditedFiles(record, "claude").map((file) => normalizeEditedPath(file, cwd));
+    const attachment = record["attachment"] as Record<string, unknown> | undefined;
+    const editedPath = record["type"] === "attachment" && attachment?.["type"] === "edited_text_file" &&
+      typeof attachment["filename"] === "string" ? normalizeEditedPath(attachment["filename"], cwd) : undefined;
+    const edits = { ...(agentEdits.length ? { agentEdits } : {}), ...(editedPath ? { editedPath } : {}) };
     const reactionAnchor = record["type"] === "assistant";
     if (forceWork) {
-      events.push({ ts, kind: "work", presence: false, reactionAnchor });
+      events.push({ ts, kind: "work", presence: false, reactionAnchor, ...edits });
     } else {
       const c = classifyRecord(record);
       const midTurn = c.kind === "prompt" && record["type"] === "queue-operation";
-      events.push({ ts, kind: c.kind, presence: c.presence, reactionAnchor, ...(midTurn ? { midTurn: true } : {}) });
+      events.push({ ts, kind: c.kind, presence: c.presence, reactionAnchor, ...edits, ...(midTurn ? { midTurn: true } : {}) });
     }
   });
   events.sort((a, b) => a.ts - b.ts);
@@ -566,10 +578,21 @@ export function computeRefinedSplit(
   const emptyEvidence = (): Evidence => ({ prompt: -1, anchor: -1, presence: -1 });
   const sessions = new Map<string | undefined, Evidence>();
   const global = emptyEvidence();
+  // Keep the two most recent distinct editors per path: enough to find an
+  // edit by any other session without retaining the entire edit history.
+  const editors = new Map<string, { session: string | undefined; ts: number }[]>();
+  let editIndex = 0;
   let previousPrompt = -1;
   let promptCount = 0;
   for (let i = 0; i < merged.length; i++) {
     const event = merged[i];
+    while (editIndex < merged.length && merged[editIndex].ts <= event.ts) {
+      const editor = merged[editIndex++];
+      for (const file of editor.agentEdits ?? []) {
+        const recent = (editors.get(file) ?? []).filter((edit) => edit.session !== editor.session);
+        editors.set(file, [{ session: editor.session, ts: editor.ts }, ...recent].slice(0, 2));
+      }
+    }
     const session = sessions.get(event.session) ?? emptyEvidence();
     sessions.set(event.session, session);
     const evidence = event.session ? session : global;
@@ -613,7 +636,10 @@ export function computeRefinedSplit(
       session.prompt = global.prompt = i;
     }
     if (event.reactionAnchor === true) session.anchor = global.anchor = i;
-    if (event.presence) session.presence = global.presence = i;
+    const otherEdit = event.editedPath && editors.get(event.editedPath)?.some(
+      (edit) => edit.session !== event.session && edit.ts >= event.ts - 30 * 60000
+    );
+    if (event.presence && !otherEdit) session.presence = global.presence = i;
   }
 
   // Allocation is independent of the range. Clip uniformly spread gap states,

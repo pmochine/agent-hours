@@ -8,6 +8,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
+import { agentEditedFiles, normalizeEditedPath } from "../edits.js";
 import { forEachJsonlRecord, isLogFileBefore } from "../jsonl.js";
 import type { NamedSession, SessionEvent, TimelineLoadOptions } from "../core.js";
 
@@ -166,7 +167,8 @@ function parseEvents(meta: CodexSessionFile, options: TimelineLoadOptions): Sess
         item["type"] === "AgentMessage") ||
       (meta.interactive && r["type"] === "realtime_item" &&
         p["type"] === "transcript_segment" && p["role"] === "assistant");
-    events.push({ ts, kind, presence: input.presence, reactionAnchor });
+    const agentEdits = agentEditedFiles(r, "codex").map((file) => normalizeEditedPath(file, meta.cwd));
+    events.push({ ts, kind, presence: input.presence, reactionAnchor, ...(agentEdits.length ? { agentEdits } : {}) });
   });
   events.sort((a, b) => a.ts - b.ts);
   return events;

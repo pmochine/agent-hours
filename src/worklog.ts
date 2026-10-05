@@ -4,6 +4,7 @@
  * from the JSONLs: typed prompts, edited files, commands, commits, and the
  * away_summary texts Claude Code itself wrote (free LLM summaries!).
  */
+import { agentEditedFiles, parseArguments } from "./edits.js";
 import * as path from "node:path";
 import {
   hourKey,
@@ -28,8 +29,6 @@ export interface HourLog {
   commits: string[];
   awaySummaries: string[];
 }
-
-const EDIT_TOOLS = new Set(["Edit", "Write", "MultiEdit", "NotebookEdit"]);
 
 function excerpt(text: string, max = 90): string {
   const clean = text.replace(/\s+/g, " ").trim();
@@ -90,6 +89,7 @@ export function collectWorklog(
       const ts = Date.parse(tsStr);
       if (Number.isNaN(ts) || ts < sinceMs || ts >= untilMs) return;
 
+      for (const file of agentEditedFiles(r, "claude")) bucket(ts).filesEdited.add(file);
       const type = r["type"];
 
       // Human prompts (top-level transcripts only — subagent "user" msgs are machine)
@@ -151,9 +151,7 @@ export function collectWorklog(
           if (it["type"] !== "tool_use") continue;
           const name = String(it["name"] ?? "");
           const input = (it["input"] ?? {}) as Record<string, unknown>;
-          if (EDIT_TOOLS.has(name) && typeof input["file_path"] === "string") {
-            bucket(ts).filesEdited.add(input["file_path"] as string);
-          } else if (name === "Bash" && typeof input["command"] === "string") {
+          if (name === "Bash" && typeof input["command"] === "string") {
             addCommand(bucket(ts), input["command"] as string);
           }
         }
@@ -184,24 +182,6 @@ function codexContentText(value: unknown): string | null {
   return parts.length ? parts.join("\n") : null;
 }
 
-function addPatchFiles(log: HourLog, patchText: string): void {
-  for (const line of patchText.split("\n")) {
-    const match = line.match(/^\*\*\* (?:Add|Update|Delete) File:\s+(.+?)\s*$/);
-    if (match) log.filesEdited.add(match[1]);
-  }
-}
-
-function parseArguments(value: unknown): Record<string, unknown> | null {
-  if (value && typeof value === "object") return value as Record<string, unknown>;
-  if (typeof value !== "string") return null;
-  try {
-    const parsed = JSON.parse(value);
-    return parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : null;
-  } catch {
-    return null;
-  }
-}
-
 /** Collects worklog evidence from current and legacy Codex rollout schemas. */
 export function collectCodexWorklog(
   projectPath: string,
@@ -230,6 +210,7 @@ export function collectCodexWorklog(
       if (typeof tsStr !== "string") return;
       const ts = Date.parse(tsStr);
       if (Number.isNaN(ts) || ts < effectiveSince || ts >= untilMs) return;
+      for (const file of agentEditedFiles(r, "codex")) bucket(ts).filesEdited.add(file);
       const payload = (r["payload"] ?? {}) as Record<string, unknown>;
       if (meta.interactive) {
         const input = codexHumanInput(r);
@@ -251,11 +232,6 @@ export function collectCodexWorklog(
               addCommand(bucket(ts), normalized);
               if (typeof callId === "string") seenCommandCalls.add(callId);
             }
-          } else if (name === "apply_patch") {
-            const patchText =
-              (args && (args["patch"] ?? args["input"])) ??
-              (typeof rawInput === "string" && !args ? rawInput : null);
-            if (typeof patchText === "string") addPatchFiles(bucket(ts), patchText);
           }
         }
         return;
@@ -271,13 +247,6 @@ export function collectCodexWorklog(
         if (cmd) {
           addCommand(bucket(ts), cmd);
           if (typeof callId === "string") seenCommandCalls.add(callId);
-        }
-      } else if (itemType === "FileChange") {
-        const changes = item["changes"];
-        if (changes && typeof changes === "object" && !Array.isArray(changes)) {
-          for (const file of Object.keys(changes as Record<string, unknown>)) {
-            bucket(ts).filesEdited.add(file);
-          }
         }
       } else if (itemType === "AgentMessage" && item["phase"] === "final_answer") {
         const content = codexContentText(item["content"]);

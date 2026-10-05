@@ -892,3 +892,112 @@ test("Codex pruning keeps old base metadata to classify a fresh continuation", (
     assert.deepEqual(mergeLogs([...collectCodexWorklog("/tmp/project", cutoff, UNTIL, "UTC", dir).values()]).prompts, ["Continue."]);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
+
+test("edited-file presence rejects another session's recent edit, including a subagent", () => {
+  const main = [
+    { ts: 0, kind: "prompt", presence: true },
+    { ts: 60000, kind: "work", presence: false, reactionAnchor: true },
+    { ts: 5 * 60000, kind: "work", presence: true, editedPath: "/tmp/proj-x/a.ts" },
+    { ts: 9 * 60000, kind: "prompt", presence: true },
+  ];
+  const split = (name, edits = ["/tmp/proj-x/a.ts"], ts = 2 * 60000) => computeRefinedSplit(mergeEvents([
+    { name: "main", events: main },
+    ...(name ? [{ name, events: [{ ts, kind: "work", presence: false, agentEdits: edits }] }] : []),
+  ]), { capMinutes: 10, promptCapMinutes: 10, timeZone: "UTC" });
+  assert.equal(split("parallel").supervisedMinutes, 0);
+  assert.equal(split("parallel", ["/tmp/proj-x/a.ts"], 5 * 60000).supervisedMinutes, 0);
+  assert.equal(split("main/subagents/agent-1.jsonl").supervisedMinutes, 0);
+  assert.equal(split(null).supervisedMinutes, 1);
+  assert.equal(split("parallel", ["/tmp/proj-x/b.ts"]).supervisedMinutes, 1);
+  assert.equal(split("main").supervisedMinutes, 1);
+  assert.equal(split("parallel", ["/tmp/proj-x/a.ts"], -26 * 60000).supervisedMinutes, 1);
+  assert.equal(split("parallel", ["/tmp/proj-x/a.ts"], -25 * 60000).supervisedMinutes, 0);
+});
+
+test("recent external edits remain attributable after a newer same-session edit", () => {
+  const events = mergeEvents([
+    { name: "main", events: [
+      { ts: 0, kind: "prompt", presence: true },
+      { ts: 60000, kind: "work", presence: false, reactionAnchor: true },
+      { ts: 3 * 60000, kind: "work", presence: false, agentEdits: ["/tmp/proj-x/a.ts"] },
+      { ts: 5 * 60000, kind: "work", presence: true, editedPath: "/tmp/proj-x/a.ts" },
+      { ts: 9 * 60000, kind: "prompt", presence: true },
+    ] },
+    { name: "parallel", events: [{ ts: 2 * 60000, kind: "work", presence: false, agentEdits: ["/tmp/proj-x/a.ts"] }] },
+  ]);
+  assert.equal(computeRefinedSplit(events, { capMinutes: 10, promptCapMinutes: 10 }).supervisedMinutes, 0);
+});
+
+test("loaders and worklogs share Claude tool and Codex patch/FileChange extraction", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ah-edits-"));
+  const cwd = "/tmp/proj-x";
+  const ts = "2026-10-05T10:00:00Z";
+  const write = (file, records) => fs.writeFileSync(file, records.map((r) => JSON.stringify(r)).join("\n"));
+  try {
+    const claude = path.join(dir, "claude");
+    fs.mkdirSync(claude);
+    const claudeRecords = [
+      ...["Edit", "Write", "MultiEdit", "NotebookEdit"].map((name) => ({ type: "assistant", cwd, timestamp: ts, message: { content: [{ type: "tool_use", name, input: { file_path: "src/../caf\u0065\u0301.ts" } }] } })),
+      { type: "attachment", cwd, timestamp: ts, attachment: { type: "edited_text_file", filename: "/tmp/proj-x/caf\u00e9.ts" } },
+    ];
+    write(path.join(claude, "session.jsonl"), claudeRecords);
+    const events = loadSessionEvents(path.join(claude, "session.jsonl"));
+    for (const event of events.slice(0, 4)) assert.deepEqual(event.agentEdits, ["/tmp/proj-x/caf\u00e9.ts"]);
+    assert.equal(events[4].editedPath, events[0].agentEdits[0]);
+    assert.deepEqual([...mergeLogs([...collectWorklog(claude, SINCE, UNTIL, "UTC").values()]).filesEdited], ["src/../caf\u0065\u0301.ts"]);
+    const codex = path.join(dir, "codex");
+    fs.mkdirSync(codex);
+    write(path.join(codex, "session.jsonl"), [
+      { type: "session_meta", timestamp: ts, payload: { id: "edits", cwd, source: "cli" } },
+      { type: "response_item", timestamp: ts, payload: { type: "custom_tool_call", name: "apply_patch", input: "*** Add File: a.ts\n*** Update File: b.ts\n*** Delete File: c.ts" } },
+      { type: "response_item", timestamp: ts, payload: { type: "function_call", name: "apply_patch", arguments: JSON.stringify({ patch: "*** Update File: d.ts" }) } },
+      { type: "event_msg", timestamp: ts, payload: { type: "item_completed", item: { type: "FileChange", changes: { "caf\u0065\u0301.ts": {} } } } },
+    ]);
+    const codexEvents = loadCodexSessions(cwd, {}, codex)[0].events;
+    assert.deepEqual(codexEvents.flatMap((event) => event.agentEdits ?? []), ["a.ts", "b.ts", "c.ts", "d.ts", "caf\u00e9.ts"].map((file) => cwd + "/" + file));
+    assert.deepEqual([...mergeLogs([...collectCodexWorklog(cwd, SINCE, UNTIL, "UTC", codex).values()]).filesEdited], ["a.ts", "b.ts", "c.ts", "d.ts", "caf\u0065\u0301.ts"]);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("streaming reader respects a byte budget without parsing a truncated record", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ah-byte-budget-"));
+  try {
+    const file = path.join(dir, "session.jsonl");
+    const first = JSON.stringify({ type: "user", message: "First." }) + "\n";
+    const final = JSON.stringify({ type: "assistant", message: "Last." });
+    fs.writeFileSync(file, first + final);
+    let bytes = 0;
+    const records = [];
+    forEachJsonlRecord(file, (record) => { records.push(record.type); }, { maxBytes: Buffer.byteLength(first) + 5, onBytesRead: (n) => { bytes += n; } });
+    assert.equal(bytes, Buffer.byteLength(first) + 5);
+    assert.deepEqual(records, ["user"]);
+    const complete = [];
+    forEachJsonlRecord(file, (record) => { complete.push(record.type); }, { maxBytes: fs.statSync(file).size });
+    assert.deepEqual(complete, ["user", "assistant"]);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("loaded subagent edits suppress normalized edited-file proof in the parent", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ah-presence-"));
+  const timestamp = (minute) => `2026-10-05T10:0${minute}:00Z`;
+  const write = (file, records) => fs.writeFileSync(file, records.map((r) => JSON.stringify(r)).join("\n"));
+  try {
+    const subagents = path.join(dir, "parent", "subagents");
+    fs.mkdirSync(subagents, { recursive: true });
+    write(path.join(dir, "parent.jsonl"), [
+      { type: "user", cwd: "/tmp/proj-x", timestamp: timestamp(0), promptSource: "typed", message: { content: "Start." } },
+      { type: "assistant", cwd: "/tmp/proj-x", timestamp: timestamp(1), message: { content: "Working." } },
+      { type: "attachment", cwd: "/tmp/proj-x", timestamp: timestamp(5), attachment: { type: "edited_text_file", filename: "caf\u00e9.ts" } },
+      { type: "user", cwd: "/tmp/proj-x", timestamp: timestamp(9), promptSource: "typed", message: { content: "Continue." } },
+    ]);
+    write(path.join(subagents, "agent-1.jsonl"), [
+      { type: "assistant", cwd: "/tmp/proj-x", timestamp: timestamp(2), message: { content: [{ type: "tool_use", name: "Edit", input: { file_path: "src/../caf\u0065\u0301.ts" } }] } },
+    ]);
+    const sessions = loadProject(dir);
+    assert.equal(sessions.length, 2);
+    const split = computeRefinedSplit(mergeEvents(sessions), { capMinutes: 10, promptCapMinutes: 10 });
+    assert.equal(split.supervisedMinutes, 0);
+    fs.rmSync(path.join(subagents, "agent-1.jsonl"));
+    assert.equal(computeRefinedSplit(mergeEvents(loadProject(dir)), { capMinutes: 10, promptCapMinutes: 10 }).supervisedMinutes, 1);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});

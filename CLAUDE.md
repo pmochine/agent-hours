@@ -8,8 +8,8 @@ Orientation for agents working in this public npm package and GitHub repo (`pmoc
 
 - **Product docs:** README.md (install, usage, methodology, roadmap).
 - **Status pointer:** PLAN.md (gitignored, local). Its last section is the live status. PLAN.md and MARKETING.md contain private context. Never copy it into tracked files.
-- **Core and entry point:** `src/core.ts` (timekeeping/split), `src/cli.ts` (CLI).
-- **Adapters:** Claude Code lives in `src/core.ts` (`findClaudeProjectDirs`, `classifyRecord`, `loadProject`) plus `collectWorklog` in `src/worklog.ts`. Codex lives in `src/sources/codex.ts` plus `collectCodexWorklog` in `src/worklog.ts`, wired in `src/cli.ts`. Events are `SessionEvent {ts, kind, presence, session?, reactionAnchor?}` inside `NamedSession[]`.
+- **Core and entry point:** `src/core.ts` (timekeeping/split), `src/cli.ts` (CLI). `src/doctor.ts` implements the read-only `agent-hours doctor [--json]` diagnostics; `src/schema.ts` holds its measured canary baseline.
+- **Adapters:** Claude Code lives in `src/core.ts` (`findClaudeProjectDirs`, `classifyRecord`, `loadProject`) plus `collectWorklog` in `src/worklog.ts`. Codex lives in `src/sources/codex.ts` plus `collectCodexWorklog` in `src/worklog.ts`, wired in `src/cli.ts`. Events are `SessionEvent {ts, kind, presence, session?, reactionAnchor?, editedPath?, agentEdits?}` inside `NamedSession[]`. `src/edits.ts` shares edit extraction with worklogs.
 - **Skill:** Source of truth is `SKILL_MD` in `src/install.ts`. `npm run build` regenerates `skills/agent-hours/SKILL.md`, which the plugin (`.claude-plugin/`, marketplace source `.`) ships. Never edit that file by hand.
 - **Tests:** `npm test` builds and runs `node --test test/*.test.mjs`.
 

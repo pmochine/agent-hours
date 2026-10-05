@@ -7,6 +7,8 @@ const unreadableFiles = new Set<string>();
 export interface JsonlOptions {
   chunkSize?: number;
   maxLines?: number;
+  maxBytes?: number;
+  onBytesRead?: (bytes: number) => void;
 }
 
 export function forEachJsonlRecord(
@@ -50,10 +52,22 @@ export function forEachJsonlRecord(
       }
       return lines < maxLines;
     };
+    let bytesRead = 0;
     while (true) {
+      const remaining = (options.maxBytes ?? Infinity) - bytesRead;
+      if (remaining <= 0) {
+        // At a complete EOF, retain a final record without a newline. Never
+        // parse a partial line when the byte budget cuts through a record.
+        try {
+          if (pending.length && fs.fstatSync(fd).size <= bytesRead) line(Buffer.alloc(0));
+        } catch { failed(); }
+        return;
+      }
       let size: number;
       try {
-        size = fs.readSync(fd, chunk, 0, chunk.length, null);
+        size = fs.readSync(fd, chunk, 0, Math.min(chunk.length, remaining), null);
+        bytesRead += size;
+        options.onBytesRead?.(size);
       } catch {
         failed();
         return;
