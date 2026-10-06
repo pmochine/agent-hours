@@ -1,5 +1,10 @@
 # agent-hours
 
+[![npm version](https://img.shields.io/npm/v/agent-hours.svg)](https://www.npmjs.com/package/agent-hours)
+[![npm downloads](https://img.shields.io/npm/dm/agent-hours.svg)](https://www.npmjs.com/package/agent-hours)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+![node >=18.11](https://img.shields.io/badge/node-%3E%3D18.11-brightgreen.svg)
+
 **Billable hours from your local coding-agent session logs — with an evidence-based split: direct interaction / supervised / AI-autonomous. Plus an hourly worklog for your invoice attachments.**
 
 ![agent-hours demo](https://raw.githubusercontent.com/pmochine/agent-hours/main/docs/demo.gif)
