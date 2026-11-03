@@ -49,7 +49,7 @@ Existing tools don't answer this:
 - **Three-state human/AI split** — direct interaction (capped reaction-time estimate), supervised (evidence-weighted), and AI-autonomous; the full attention budget for each prompt window is shown as an upper estimate, so you get a transparent band rather than fake precision.
 - **Multi-agent, one timeline** — Claude Code and Codex CLI sessions merge into a single timeline. Parallel agents never double-count wall-clock time; an agent launched *by* another agent counts as AI runtime, not as you.
 - **Hourly worklog** — what was done per hour: your prompts, edited files (incl. subagents), commands, commit messages, and the away-summaries the agent itself wrote.
-- **Descriptions with or without AI** — rule-based summaries are the default (deterministic, free, reproducible). `--summarize` optionally refines them via `claude -p` — the only feature that costs API money, strictly opt-in. It is also the only feature that sends data off the machine: prompt excerpts, file paths and commit messages go to Claude via `claude -p`. Or pipe `--worklog-json` into the AI chat you're already paying for.
+- **Descriptions with or without AI** — rule-based summaries are the default (deterministic, free, reproducible). `--summarize` optionally refines them via `claude -p` — the only feature that costs API money, strictly opt-in. It is also the only feature that sends data off the machine: prompt excerpts, file paths, commit messages, away-summary excerpts and Codex final-answer excerpts go to Claude via `claude -p`. Or pipe `--worklog-json` into the AI chat you're already paying for.
 - **Exports** — CSV (hours/days, with description column and project total row; English headers by default, `--lang de` for German headers), JSON, markdown worklog.
 - **Regression-tested timekeeping core** — merged-timeline idle-cap math, parallel-session detection, pause analysis, cap-bonus vs. strict columns, per-session breakdown.
 - **All projects at a glance** — `--all-projects` ranks everything on your machine.
@@ -90,7 +90,7 @@ npx agent-hours --split            # direct interaction / supervised / AI-autono
 npx agent-hours --by-day --split   # per-day table with split
 
 # worklog: what was done, hour by hour
-npx agent-hours --worklog                  # markdown, rule-based descriptions
+npx agent-hours --worklog                  # markdown with evidence excerpts
 npx agent-hours --worklog --summarize      # + AI-refined lines (claude -p, paid)
 npx agent-hours --worklog --csv            # hourly CSV incl. description column
 npx agent-hours --worklog --csv --by-day   # daily CSV incl. descriptions
