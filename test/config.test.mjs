@@ -28,6 +28,10 @@ test("config resolves XDG or home defaults and tolerates only a missing default 
       fs.writeFileSync(file, value);
       assert.throws(() => loadConfig(), (error) => error.message.includes(file) && problem.test(error.message));
     }
+    for (const prefix of [" [orch]", "\t[orch]", "\n[orch]"]) {
+      fs.writeFileSync(file, JSON.stringify({ relayPrefixes: [prefix] }));
+      assert.throws(() => loadConfig(), /relayPrefixes must not start with whitespace/);
+    }
     fs.writeFileSync(file, "{}");
     assert.deepEqual(loadConfig(file), { relayPrefixes: [], clients: {} });
   } finally {

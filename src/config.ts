@@ -40,6 +40,7 @@ export function loadConfig(explicitPath?: string): AgentHoursConfig {
   if (!Array.isArray(prefixes) || prefixes.some((prefix) => typeof prefix !== "string" || prefix.length === 0)) {
     throw problem("relayPrefixes must be an array of non-empty strings");
   }
+  if (prefixes.some((prefix) => /^\s/.test(prefix))) throw problem("relayPrefixes must not start with whitespace");
   const object = (value: unknown): value is Record<string, unknown> =>
     !!value && typeof value === "object" && !Array.isArray(value);
   const rawClients = "clients" in config ? config["clients"] : {};

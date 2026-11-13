@@ -11,10 +11,14 @@ const texts = [
   '  <pasted_content id="8124">\n[orch] New task.\n</pasted_content>',
   '[Image #1]\n\n<pasted_content id="5386">\n[orch] Task.',
 ];
-test("relay prefixes match only the start after whitespace, image and paste wrappers", () => {
+test("relay prefixes match only the start after whitespace, image and paste wrappers, and one slash command", () => {
   for (const text of texts) assert.equal(isRelayedPrompt(text, ["[orch]"]), true);
-  for (const text of ["Continue [orch] now.", "/cmd [orch] Task.", "[other] Task.", "[ORCH] Task."]) {
+  for (const text of ["Continue [orch] now.", "/cmd /other [orch] Task.", "[other] Task.", "[ORCH] Task."]) {
     assert.equal(isRelayedPrompt(text, ["[orch]"]), false);
+  }
+  for (const text of ["/cmd [orch] Task.", '<pasted_content id="123">\n/some-command [orch] Task.',
+    ' [Image #1]\n<pasted_content id="456">\n/cmd_2:part.ext [orch] Task.']) {
+    assert.equal(isRelayedPrompt(text, ["[orch]"]), true);
   }
   assert.equal(isRelayedPrompt(texts[0], []), false);
 });

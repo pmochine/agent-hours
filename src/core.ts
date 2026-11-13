@@ -314,7 +314,8 @@ export function classifyRecord(record: unknown): Classified {
 /** Match relay prefixes after Claude's paste and image wrappers. */
 export function isRelayedPrompt(text: string, prefixes: readonly string[]): boolean {
   const unwrapped = text.replace(/^(?:\s+|\[Image #\d+\]|<pasted_content\b[^>]*>)*/, "");
-  return prefixes.some((prefix) => unwrapped.startsWith(prefix));
+  const withoutCommand = unwrapped.replace(/^\/[A-Za-z0-9_:.\-]+\s+/, "");
+  return prefixes.some((prefix) => withoutCommand.startsWith(prefix));
 }
 
 /** Only the record's own prompt text; question answers are never relayed. */

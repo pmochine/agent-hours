@@ -51,9 +51,9 @@ function binaryVersion(binary: string): string | null {
 
 export function collectDoctor(now = Date.now()) {
   const configPath = defaultConfigPath();
-  const config = { path: displayPath(configPath), exists: fs.existsSync(configPath), relayPrefixes: [] as string[], clients: 0, error: null as string | null };
-  try { const loaded = loadConfig(); config.relayPrefixes = loaded.relayPrefixes; config.clients = Object.keys(loaded.clients).length; }
-  catch (error) { config.error = (error as Error).message.replaceAll(os.homedir(), "~").replace(/client "(?:\\.|[^"\\])*": /g, "client: ").replace(/duplicate project path in clients .*/, "duplicate project path in clients"); }
+  const config = { path: displayPath(configPath), exists: fs.existsSync(configPath), valid: true, relayPrefixes: 0, clients: 0 };
+  try { const loaded = loadConfig(); config.relayPrefixes = loaded.relayPrefixes.length; config.clients = Object.keys(loaded.clients).length; }
+  catch { config.valid = false; }
   const files: LogFile[] = [];
   const unsupported = new Map<string, number>();
   let nestedSubagentDirectories = 0;
@@ -184,6 +184,7 @@ export function collectDoctor(now = Date.now()) {
   };
   const structure = { nestedSubagentDirectories, historyBaseFiles, unsupportedFiles: counted(unsupported), unreadableFiles, inventoryFailures };
   const warnings: string[] = [];
+  if (!config.valid) warnings.push("Invalid config (run a report command to see the error).");
   if (oldestAgeDays !== null && oldestAgeDays >= cleanupPeriodDays - 7) warnings.push("Oldest Claude session file is within 7 days of pruning age or older.");
   if (unknownClaude.size) warnings.push("Unknown timestamped Claude kinds.");
   if (unknownCodex.size) warnings.push("Unknown timestamped Codex kinds.");
@@ -200,7 +201,7 @@ export function collectDoctor(now = Date.now()) {
 }
 
 export function formatDoctor(report: ReturnType<typeof collectDoctor>): string {
-  const lines = [`Config: ${report.config.path}; exists=${report.config.exists}; ${report.config.error ?? `${report.config.relayPrefixes.length} relay prefixes; ${report.config.clients} clients`}`, "Sources:"];
+  const lines = [`Config: ${report.config.path}; exists=${report.config.exists}; ${report.config.valid ? `${report.config.relayPrefixes} relay prefixes; ${report.config.clients} clients` : "invalid (run a report command to see the error)"}`, "Sources:"];
   for (const [name, source] of [ ["Claude projects", report.sources.claude], ["Codex sessions", report.sources.codexSessions], ["Codex archived sessions", report.sources.codexArchivedSessions] ] as const) {
     lines.push(`  ${name}: ${source.directory}; exists=${source.exists}; ${source.projectDirectories === undefined ? "" : `${source.projectDirectories} project directories; `}${source.files} files; ${source.bytes} bytes`);
   }

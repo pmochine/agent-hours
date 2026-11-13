@@ -631,9 +631,15 @@ test("clients JSON reports capped attention, shares, peers and unassigned reposi
       assert.equal(client.attentionHours, 0.67); assert.equal(client.overlapHours, 0.17); assert.equal(client.billableHours, 0.5);
       const project = client.name === "acme" ? "/tmp/acme/shop" : "/tmp/globex/api";
       assert.deepEqual(client.projects, [{ project, attentionHours: 0.67 }]);
-      assert.deepEqual(client.byDay, [{ date: "2026-10-01", attentionHours: 0.67, overlapHours: 0.17, billableHours: 0.5 }]);
+      assert.deepEqual(client.byDay, [{ date: "2026-10-01", attentionHours: 0.67, overlapHours: 0.17, billableHours: 0.5, attentionMinutes: 40, overlapMinutes: 10, billableMinutes: 30 }]);
       assert.deepEqual(client.byHour, [{ hour: "2026-10-01 10:00", attentionMinutes: 40, capFactor: 0.75, overlapMinutes: 10, billableMinutes: 30,
         projects: { [project]: 40 }, sharedWith: { [client.name === "acme" ? "globex" : "acme"]: 40 } }]);
+    }
+    for (const client of json.clients) {
+      for (const key of ["attentionMinutes", "overlapMinutes", "billableMinutes"]) {
+        if (!client.billable && key !== "attentionMinutes") assert.equal(client.byDay[0][key], null);
+        else assert.equal(client.byDay.reduce((sum, day) => sum + day[key], 0), client.byHour.reduce((sum, hour) => sum + hour[key], 0));
+      }
     }
     const own = json.clients[2];
     assert.equal(own.billable, false); assert.equal(own.attentionHours, 0.67);
@@ -644,7 +650,10 @@ test("clients JSON reports capped attention, shares, peers and unassigned reposi
     assert.deepEqual(json.unassigned, [{ project: "/tmp/unassigned", attentionHours: 0.67 }]);
     const filtered = execute(["--client", "acme", "--json"]);
     assert.equal(filtered.status, 0, filtered.stderr);
-    assert.deepEqual(JSON.parse(filtered.stdout).clients, [json.clients[0]]);
+    const filteredJson = JSON.parse(filtered.stdout);
+    assert.equal("unassigned" in filteredJson, false);
+    assert.deepEqual(filteredJson.clients, [{ ...json.clients[0], byHour: [{ ...json.clients[0].byHour[0], sharedWith: { others: 40 } }] }]);
+    assert.doesNotMatch(filtered.stdout, /globex|\/tmp\/unassigned|\/tmp\/own/);
     const relayed = execute(["--json", "--relay-prefix", "Continue."]);
     assert.equal(relayed.status, 0, relayed.stderr);
     assert.ok(JSON.parse(relayed.stdout).clients.every((c) => c.attentionHours === 0 && c.byHour.length === 0));
@@ -652,6 +661,49 @@ test("clients JSON reports capped attention, shares, peers and unassigned reposi
     assert.equal(fixed.status, 1);
     const source = execute(["--source", "codex", "--json"]);
     assert.equal(source.status, 0, source.stderr); assert.ok(JSON.parse(source.stdout).clients.every((c) => c.attentionHours === 0));
+  });
+});
+
+test("client daily JSON minutes sum hourly minutes across days and filtered peers are summed", () => {
+  withReviewLogs(({ claude, codex, write, run }) => {
+    const clients = {};
+    for (const name of ["a", "b", "c", "own"]) {
+      const cwd = `/tmp/client-${name}`;
+      clients[name] = { projects: [cwd], billable: name !== "own" };
+      write(path.join(claude, name, "session.jsonl"), [1, 2].flatMap((day) =>
+        [0, 10, 20, 30, 40, 41].map((minute) => claudePrompt(`2026-10-0${day}T10:${String(minute).padStart(2, "0")}:00Z`, cwd))));
+    }
+    const file = path.join(path.dirname(codex), "clients.json");
+    fs.writeFileSync(file, JSON.stringify({ clients }));
+    const args = ["clients", "--config", file, "--timezone", "UTC", "--json"];
+    const result = run(args);
+    assert.equal(result.status, 0, result.stderr);
+    const report = JSON.parse(result.stdout);
+    for (const client of report.clients) {
+      assert.equal(client.byDay.length, 2);
+      for (const key of ["attentionMinutes", "overlapMinutes", "billableMinutes"]) {
+        if (!client.billable && key !== "attentionMinutes") {
+          assert.ok(client.byDay.every((day) => day[key] === null));
+          continue;
+        }
+        for (const day of client.byDay) {
+          const hours = client.byHour.filter((hour) => hour.hour.startsWith(day.date));
+          assert.ok(Math.abs(day[key] - hours.reduce((sum, hour) => sum + hour[key], 0)) < 0.001);
+        }
+        assert.ok(Math.abs(client.byDay.reduce((sum, day) => sum + day[key], 0) - client.byHour.reduce((sum, hour) => sum + hour[key], 0)) < 0.001);
+      }
+    }
+    const filtered = run([...args, "--client", "a"]);
+    assert.equal(filtered.status, 0, filtered.stderr);
+    const json = JSON.parse(filtered.stdout);
+    assert.equal("unassigned" in json, false);
+    assert.deepEqual(json.clients[0].byHour.map((hour) => ({ hour: hour.hour, sharedWith: hour.sharedWith })), [
+      { hour: "2026-10-01 10:00", sharedWith: { others: 82 } },
+      { hour: "2026-10-02 09:00", sharedWith: undefined },
+      { hour: "2026-10-02 10:00", sharedWith: { others: 82 } },
+    ]);
+    assert.deepEqual(report.clients[0].byHour.map((hour) => hour.sharedWith), [{ b: 41, c: 41 }, undefined, { b: 41, c: 41 }]);
+    assert.equal(json.clients[0].byHour[1].capFactor, 1);
   });
 });
 
@@ -664,6 +716,9 @@ test("clients human views and daily/hourly CSV in both languages", () => {
     assert.match(human.stdout, /own \(non-billable\) +\| +0\.67 \| +— \| +—/);
     assert.match(human.stdout, /Non-billable clients are excluded from the hourly cap/);
     assert.match(human.stdout, /Unassigned: 1 projects, 0\.67 h attention \(use --json to list them\)/);
+    const filtered = execute(["--client", "acme"]);
+    assert.equal(filtered.status, 0, filtered.stderr);
+    assert.doesNotMatch(filtered.stdout, /Unassigned|globex|own/);
     for (const [flags, pattern] of [
       [["--by-day"], /2026-10-01 \| acme +\| +0\.67 \| +0\.17 \| +0\.50/],
       [["--by-hour"], /2026-10-01 10:00 \| acme +\| +40\.000 \| +0\.750 \| +10\.000 \| +30\.000/],
@@ -703,6 +758,13 @@ test("clients rejects unsupported options, missing configuration, and unknown na
       const result = fixtureRun(args); assert.equal(result.status, 1); assert.match(result.stderr, /--by-hour requires the clients command/);
     }
     const empty = execute(["--relay-prefix", ""]); assert.equal(empty.status, 1); assert.match(empty.stderr, /--relay-prefix must be a non-empty string/);
+    for (const prefix of [" [orch]", "\t[orch]", "\n[orch]"]) {
+      for (const runPrefix of [execute, fixtureRun]) {
+        const result = runPrefix(["--relay-prefix", prefix]);
+        assert.equal(result.status, 1);
+        assert.match(result.stderr, /--relay-prefix must not start with whitespace/);
+      }
+    }
     const plainEmpty = fixtureRun(["--relay-prefix", ""]); assert.equal(plainEmpty.status, 1); assert.match(plainEmpty.stderr, /non-empty string/);
     fs.writeFileSync(file, "{}");
     const noClients = execute([]); assert.equal(noClients.status, 1); assert.match(noClients.stderr, /No clients configured.*README.*configuration/);

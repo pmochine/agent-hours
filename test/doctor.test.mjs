@@ -293,67 +293,69 @@ test("doctor reports default config status and survives invalid config without p
     const file = path.join(configHome, "agent-hours", "config.json");
     const missing = JSON.parse(run(["--json"]).stdout).config;
     assert.equal(missing.exists, false);
-    assert.deepEqual(missing.relayPrefixes, []);
-    assert.equal(missing.error, null);
+    assert.equal(missing.relayPrefixes, 0);
+    assert.equal(missing.valid, true);
+    assert.equal(missing.clients, 0);
+    assert.equal("error" in missing, false);
     assert.ok(missing.path.endsWith("/agent-hours/config.json"));
     fs.mkdirSync(path.dirname(file));
     fs.writeFileSync(file, JSON.stringify({ relayPrefixes: ["[orch]"] }));
     const valid = JSON.parse(run(["--json"]).stdout).config;
     assert.equal(valid.exists, true);
-    assert.deepEqual(valid.relayPrefixes, ["[orch]"]);
-    assert.equal(valid.error, null);
+    assert.equal(valid.relayPrefixes, 1);
+    assert.equal(valid.valid, true);
+    assert.equal("error" in valid, false);
     assert.match(run().stdout, /Config: .*exists=true; 1 relay prefixes/);
     fs.writeFileSync(file, '{"relayPrefixes": ["Private prompt content."],');
     const result = run(["--json", "--config", "ignored.json"]);
     assert.equal(result.status, 0, result.stderr);
     const broken = JSON.parse(result.stdout).config;
     assert.equal(broken.exists, true);
-    assert.deepEqual(broken.relayPrefixes, []);
-    assert.match(broken.error, /config.json: invalid JSON/);
-    assert.match(run().stdout, /Config: .*invalid JSON/);
+    assert.equal(broken.relayPrefixes, 0);
+    assert.equal(broken.clients, 0);
+    assert.equal(broken.valid, false);
+    assert.equal("error" in broken, false);
+    assert.match(run().stdout, /Config: .*exists=true; invalid \(run a report command to see the error\)/);
+    assert.ok(JSON.parse(result.stdout).warnings.some((warning) => /Invalid config/.test(warning)));
     assert.doesNotMatch(result.stdout, /Private prompt content/);
   });
 });
 
-test("doctor reports only client counts and removes names from duplicate-path errors", () => {
+test("doctor reports config counts and never includes config content or validation errors", () => {
   fixture(({ configHome, run }) => {
     const file = path.join(configHome, "agent-hours", "config.json");
     fs.mkdirSync(path.dirname(file));
     const clients = { acme: { projects: ["/tmp/client-a"] }, globex: { projects: ["/tmp/client-b"] } };
-    fs.writeFileSync(file, JSON.stringify({ clients }));
-    const result = run(["--json"]);
-    assert.equal(result.status, 0, result.stderr);
-    assert.equal(JSON.parse(result.stdout).config.clients, 2);
-    assert.match(run().stdout, /0 relay prefixes; 2 clients/);
-    assert.doesNotMatch(result.stdout, /acme|globex|\/tmp\/client-/);
-    clients.globex.projects = clients.acme.projects;
-    fs.writeFileSync(file, JSON.stringify({ clients }));
+    fs.writeFileSync(file, JSON.stringify({ clients, relayPrefixes: ["private-prefix"] }));
     for (const args of [[], ["--json"]]) {
-      const broken = run(args);
-      assert.equal(broken.status, 0, broken.stderr);
-      assert.match(broken.stdout, /duplicate project path in clients/);
-      assert.doesNotMatch(broken.stdout, /acme|globex|\/tmp\/client-/);
+      const result = run(args);
+      assert.equal(result.status, 0, result.stderr);
+      assert.doesNotMatch(result.stdout, /acme|globex|\/tmp\/client-|private-prefix/);
+      if (args.length) assert.deepEqual(JSON.parse(result.stdout).config, {
+        path: "~/config/agent-hours/config.json", exists: true, valid: true, relayPrefixes: 1, clients: 2,
+      });
+      else assert.match(result.stdout, /1 relay prefixes; 2 clients/);
     }
-  });
-});
-
-
-test("doctor strips client names from every contextual validation error", () => {
-  fixture(({ configHome, run }) => {
-    const file = path.join(configHome, "agent-hours", "config.json");
-    fs.mkdirSync(path.dirname(file));
-    for (const name of ["private-client", 'private-"client', "private-\nclient"]) {
-      for (const value of [null, { projets: [] }, { billable: "yes" }, { projects: [] },
+    for (const config of [
+      { "private-client-name": { projects: ["/tmp/private-project"] } },
+      { "/tmp/private-project": {} },
+      { clients: { acme: clients.acme, globex: clients.acme } },
+      ...[null, { projets: [] }, { billable: "yes" }, { projects: [] },
         { projects: [null] }, { projects: [{ path: "/tmp/private-project", extra: true }] },
         { projects: [{ path: "/tmp/private-project", descendants: "yes" }] },
-        { projects: ["/tmp/private-project", "private-relative-path"] }]) {
-        fs.writeFileSync(file, JSON.stringify({ clients: { [name]: value } }));
-        for (const args of [[], ["--json"]]) {
-          const result = run(args);
-          assert.equal(result.status, 0, result.stderr);
-          assert.doesNotMatch(result.stdout, /private-|private-project|private-relative-path/);
-          assert.match(result.stdout, /client:/);
-        }
+        { projects: ["/tmp/private-project", "private-relative-path"] }]
+        .map((value) => ({ clients: { 'private-"client': value } })),
+    ]) {
+      fs.writeFileSync(file, JSON.stringify(config));
+      for (const args of [[], ["--json"]]) {
+        const result = run(args);
+        assert.equal(result.status, 0, result.stderr);
+        assert.doesNotMatch(result.stdout, /private-|acme|globex|\/tmp\/client-|unknown top-level|duplicate project|client:/);
+        if (args.length) {
+          const report = JSON.parse(result.stdout);
+          assert.deepEqual(report.config, { path: "~/config/agent-hours/config.json", exists: true, valid: false, relayPrefixes: 0, clients: 0 });
+          assert.ok(report.warnings.some((warning) => /Invalid config/.test(warning)));
+        } else assert.match(result.stdout, /Config: .*exists=true; invalid \(run a report command to see the error\)/);
       }
     }
   });

@@ -329,6 +329,7 @@ async function main(): Promise<void> {
 
   if (args["relay-prefix"]?.some((prefix) => prefix.length === 0)) fail("--relay-prefix must be a non-empty string.");
   const config = loadConfig(args.config);
+  if (args["relay-prefix"]?.some((prefix) => /^\s/.test(prefix))) fail("--relay-prefix must not start with whitespace.");
   const relayPrefixes = [...new Set([...config.relayPrefixes, ...(args["relay-prefix"] ?? [])])];
   if (clientsCommand) {
     const names = Object.keys(config.clients);
@@ -405,13 +406,13 @@ async function main(): Promise<void> {
         capMinutes: cap, promptCapMinutes: promptCap, hourlyCapMinutes: HOURLY_CAP_MINUTES,
         timeZone: typeof timeZone === "string" ? timeZone : null,
         tzOffsetHours: typeof timeZone === "number" ? timeZone : null,
-        source, relayPrefixes, clients: clients.map(clientJson),
-        unassigned: report.unassigned.map((project) => ({ project: project.project, attentionHours: roundedHours(project.attentionMinutes) })),
+        source, relayPrefixes, clients: clients.map((client) => clientJson(client, args.client !== undefined)),
+        ...(args.client === undefined ? { unassigned: report.unassigned.map((project) => ({ project: project.project, attentionHours: roundedHours(project.attentionMinutes) })) } : {}),
       }, null, 2));
     } else {
       printClients(clients, args.csv, args["by-day"], args["by-hour"], lang,
         `${args.since ?? "all history"} – ${args.until ?? "now"}; zone ${timeZone}; cap ${cap}min / prompt cap ${promptCap}min / hourly cap ${HOURLY_CAP_MINUTES}min`);
-      if (!args.csv && report.unassigned.length) {
+      if (!args.csv && args.client === undefined && report.unassigned.length) {
         console.log(`Unassigned: ${report.unassigned.length} projects, ${fmtH(report.unassigned.reduce((sum, project) => sum + project.attentionMinutes, 0))} h attention (use --json to list them).`);
       }
     }
@@ -997,17 +998,19 @@ function roundedHours(minutes: number | null): number | null {
 function roundedMinutes(minutes: number | null): number | null {
   return minutes === null ? null : +minutes.toFixed(3);
 }
-function clientJson(client: ClientResult) {
+function clientJson(client: ClientResult, filtered: boolean) {
   return {
     name: client.name, billable: client.billable,
     totalHours: roundedHours(client.totalMinutes), aiAutonomousHours: roundedHours(client.aiAutonomousMinutes),
     attentionHours: roundedHours(client.attentionMinutes), overlapHours: roundedHours(client.overlapMinutes), billableHours: roundedHours(client.billableMinutes),
     projects: client.projects.map((project) => ({ project: project.project, attentionHours: roundedHours(project.attentionMinutes) })),
-    byDay: client.byDay.map((day) => ({ date: day.date, attentionHours: roundedHours(day.attentionMinutes), overlapHours: roundedHours(day.overlapMinutes), billableHours: roundedHours(day.billableMinutes) })),
+    byDay: client.byDay.map((day) => ({ date: day.date, attentionHours: roundedHours(day.attentionMinutes), overlapHours: roundedHours(day.overlapMinutes), billableHours: roundedHours(day.billableMinutes),
+      attentionMinutes: roundedMinutes(day.attentionMinutes), overlapMinutes: roundedMinutes(day.overlapMinutes), billableMinutes: roundedMinutes(day.billableMinutes) })),
     byHour: client.byHour.map((hour) => ({
       ...hour, attentionMinutes: roundedMinutes(hour.attentionMinutes), overlapMinutes: roundedMinutes(hour.overlapMinutes), billableMinutes: roundedMinutes(hour.billableMinutes),
       projects: Object.fromEntries(Object.entries(hour.projects).map(([project, minutes]) => [project, roundedMinutes(minutes)])),
-      ...(hour.sharedWith ? { sharedWith: Object.fromEntries(Object.entries(hour.sharedWith).map(([name, minutes]) => [name, roundedMinutes(minutes)])) } : {}),
+      ...(hour.sharedWith ? { sharedWith: filtered ? { others: roundedMinutes(Object.values(hour.sharedWith).reduce((sum, minutes) => sum + minutes, 0)) }
+        : Object.fromEntries(Object.entries(hour.sharedWith).map(([name, minutes]) => [name, roundedMinutes(minutes)])) } : {}),
     })),
   };
 }

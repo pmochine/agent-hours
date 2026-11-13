@@ -119,3 +119,10 @@ test("project shares fall back to standalone activity, then equal shares", () =>
   near(even.attentionMinutes, 10);
   even.projects.forEach((p) => near(p.attentionMinutes, 5));
 });
+
+test("a parent project without its own sessions remains visible when another client owns the subdirectory", () => {
+  const report = computeClients({ a: client(["/w/app"]), b: client(["/w/app/sub"]) }, [project("/w/app/sub")], options);
+  assert.deepEqual(report.clients[0].projects, [{ project: "/w/app", attentionMinutes: 0 }]);
+  near(report.clients[0].attentionMinutes, 0);
+  near(report.clients[1].attentionMinutes, 40);
+});

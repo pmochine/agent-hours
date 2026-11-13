@@ -2,7 +2,7 @@
 
 Orientation for agents working in this public npm package and GitHub repo (`pmochine/agent-hours`). README.md is the product documentation.
 
-**Last verified:** 2026-10-05
+**Last verified:** 2026-11-13
 
 ## Where things live
 

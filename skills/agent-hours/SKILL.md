@@ -45,11 +45,15 @@ agent-hours doctor                         # source, retention, and schema diagn
 
 - For billing a client across repositories, use `agent-hours clients --client <name> --json`
   with configured client projects. The hourly cap includes all billable clients
-  even when output is filtered; non-billable clients are excluded.
+  even when output is filtered; non-billable clients are excluded. Filtered JSON
+  omits unassigned projects and combines other clients’ shared-hour minutes under
+  `sharedWith.others`; filtered text omits the Unassigned footer.
 
 - When hours look wrong or after an agent update, run `agent-hours doctor`
   (or `agent-hours doctor --json`). It is read-only and reports counts and
-  schema names, never prompts, log content, or project paths.
+  schema names, source directories, binary versions, retention status, and the
+  default config path, existence, validity, and counts. It never prints prompts,
+  log content, client names, or project paths from the config.
 - `--source auto` merges Claude Code + Codex into ONE timeline; parallel
   agents and agent-launched agents do not double-count wall-clock time.
 - Codex reads both active `sessions` and `archived_sessions` from

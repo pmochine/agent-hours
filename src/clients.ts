@@ -98,7 +98,7 @@ export function computeClients(
     }
     for (const entry of config.projects) {
       const prefix = entry.path.endsWith(path.sep) ? entry.path : entry.path + path.sep;
-      const hasSessions = projects.some((project) => project.sessions.length > 0 &&
+      const hasSessions = group.some((project) => project.sessions.length > 0 &&
         (project.project === entry.path || (entry.descendants && project.project.startsWith(prefix))));
       if (!hasSessions && !shares.some((share) => share.project === entry.path)) {
         shares.push({ project: entry.path, attentionMinutes: 0 });
