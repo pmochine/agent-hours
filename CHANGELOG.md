@@ -4,6 +4,10 @@ All notable changes are documented here, following [Keep a Changelog](https://ke
 
 ## [Unreleased]
 
+### Changed
+
+- Place direct-interaction tails at the end of each gap before the prompt or intervening event; hourly, daily, and range distributions shift while all-time sums remain unchanged.
+
 ### Added
 
 - `agent-hours clients` groups repositories by configured client, unions attention per client, and proportionally caps billable clients together at 60 minutes per clock hour. Includes project shares, unassigned repositories, client filtering, daily/hourly text and CSV views, JSON evidence, and configured client counts in doctor.

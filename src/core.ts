@@ -607,6 +607,10 @@ export interface RefinedOptions {
  *    mid-turn, external file edit) forces 100 %.
  * 3. AI autonomous — total minus the two above.
  *
+ * Place the rest after the earlier event and the direct-interaction tail
+ * directly before the next merged event, leaving any uncredited pause between.
+ * Clip both segments to the range and hourly buckets without reallocating.
+ *
  * Invariant, per credited gap: handsOn + supervised <= upperBound <= total.
  * A fast reaction proves presence at the END of a window, not throughout —
  * capping supervision at the prompt-cap window encodes exactly that.
@@ -622,6 +626,7 @@ export function computeRefinedSplit(
   const rangeEnd = opts.rangeEndMs ?? Infinity;
   const gaps = merged.slice(1).map((event, i) => ({
     start: merged[i].ts,
+    end: event.ts,
     credit: Math.min((event.ts - merged[i].ts) / 60000, opts.capMinutes),
     handsOn: 0,
     supervised: 0,
@@ -698,8 +703,9 @@ export function computeRefinedSplit(
     if (event.presence && !otherEdit) session.presence = global.presence = i;
   }
 
-  // Allocation is independent of the range. Clip uniformly spread gap states,
-  // then divide at UTC quarter-hours (including DST folds). This assumes
+  // Allocation is independent of the range. Clip the rest at the gap start
+  // and the hands-on tail at its real end separately, spreading each segment
+  // uniformly and dividing at UTC quarter-hours (including DST folds). This assumes
   // quarter-hour zone offsets, also required by hourKey caching.
   const byHour = new Map<string, HourStates>();
   const SLOT = 15 * 60000;
@@ -709,31 +715,39 @@ export function computeRefinedSplit(
   let upperBound = 0;
   let ai = 0;
   for (const gap of gaps) {
-    const end = Math.min(gap.start + gap.credit * 60000, rangeEnd);
-    let start = Math.max(gap.start, rangeStart);
-    while (start < end) {
-      const slot = Math.floor(start / SLOT) * SLOT;
-      const partEnd = Math.min(end, slot + SLOT);
-      const key = hourKey(slot, timeZone);
-      const bucket = byHour.get(key) ?? { total: 0, handsOn: 0, supervised: 0, ai: 0, upper: 0 };
-      const minutes = (partEnd - start) / 60000;
-      const fraction = minutes / gap.credit;
-      const direct = gap.handsOn * fraction;
-      const watched = gap.supervised * fraction;
-      const upper = gap.upper * fraction;
-      const autonomous = Math.max(0, minutes - direct - watched);
-      bucket.total += minutes;
-      bucket.handsOn += direct;
-      bucket.supervised += watched;
-      bucket.upper += upper;
-      bucket.ai += autonomous;
-      byHour.set(key, bucket);
-      total += minutes;
-      handsOn += direct;
-      supervised += watched;
-      upperBound += upper;
-      ai += autonomous;
-      start = partEnd;
+    const rest = gap.credit - gap.handsOn;
+    const segments = [
+      { start: gap.start, credit: rest, handsOn: 0, supervised: gap.supervised, upper: gap.upper - gap.handsOn },
+      { start: gap.end - gap.handsOn * 60000, credit: gap.handsOn, handsOn: gap.handsOn, supervised: 0, upper: gap.handsOn },
+    ];
+    for (const segment of segments) {
+      if (segment.credit <= 0) continue;
+      const end = Math.min(segment.start + segment.credit * 60000, rangeEnd);
+      let start = Math.max(segment.start, rangeStart);
+      while (start < end) {
+        const slot = Math.floor(start / SLOT) * SLOT;
+        const partEnd = Math.min(end, slot + SLOT);
+        const key = hourKey(slot, timeZone);
+        const bucket = byHour.get(key) ?? { total: 0, handsOn: 0, supervised: 0, ai: 0, upper: 0 };
+        const minutes = (partEnd - start) / 60000;
+        const fraction = minutes / segment.credit;
+        const direct = segment.handsOn * fraction;
+        const watched = segment.supervised * fraction;
+        const upper = segment.upper * fraction;
+        const autonomous = Math.max(0, minutes - direct - watched);
+        bucket.total += minutes;
+        bucket.handsOn += direct;
+        bucket.supervised += watched;
+        bucket.upper += upper;
+        bucket.ai += autonomous;
+        byHour.set(key, bucket);
+        total += minutes;
+        handsOn += direct;
+        supervised += watched;
+        upperBound += upper;
+        ai += autonomous;
+        start = partEnd;
+      }
     }
   }
   return {

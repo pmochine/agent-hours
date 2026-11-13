@@ -293,8 +293,8 @@ test("CLI adjacent date ranges stay additive across a multi-day prompt gap", () 
       assert.ok(Math.abs(first[key] + second[key] - whole[key]) < 1e-9, key);
     }
     assert.equal(whole.totalHours, 0.2);
-    assert.equal(first.totalHours, 0.05);
-    assert.equal(second.totalHours, 0.15);
+    assert.equal(first.totalHours, 0);
+    assert.equal(second.totalHours, 0.2);
   });
 });
 
@@ -466,7 +466,14 @@ test("CLI pruning preserves the first loaded prompt reaction tail for both sourc
 });
 
 test("CLI all-projects lastActivity uses the latest event crediting an otherwise empty range", () => {
-  withCodexRecords(["2026-09-01T10:00:00Z", "2026-09-04T23:59:00Z", "2026-09-06T10:00:00Z"].map(codexPrompt), (env) => {
+  const records = ["2026-09-01T10:00:00Z", "2026-09-04T23:59:00Z", "2026-09-06T10:00:00Z"].map(codexPrompt);
+  withCodexRecords(records, (env) => {
+    const result = run(["--all-projects", "--source", "codex", "--timezone", "UTC", "--since", "2026-09-05", "--until", "2026-09-05", "--json"], env);
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(JSON.parse(result.stdout).projects, []);
+  });
+  records[2] = { type: "event_msg", timestamp: "2026-09-06T10:00:00Z", payload: { type: "task_started" } };
+  withCodexRecords(records, (env) => {
     const result = run(["--all-projects", "--source", "codex", "--timezone", "UTC", "--since", "2026-09-05", "--until", "2026-09-05", "--json"], env);
     assert.equal(result.status, 0, result.stderr);
     const row = JSON.parse(result.stdout).projects[0];

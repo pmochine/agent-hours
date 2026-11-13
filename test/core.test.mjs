@@ -229,7 +229,7 @@ test("refined split ignores background-session noise for reaction evidence", () 
     timeZone: "UTC",
   });
   assert.equal(r.supervisedMinutes, 0);
-  assert.equal(r.handsOnMinutes, 8);
+  near(r.handsOnMinutes, 8);
 });
 
 test("refined split preserves non-negative global and hourly invariants for unequal caps", () => {
@@ -1219,4 +1219,86 @@ test("Codex metadata and timeline scans preserve multiple threads and id-less fi
     assert.equal(new Set(anonymous.map((meta) => meta.session.name)).size, 2);
     assert.equal(mergeEvents(scanned.map((meta) => meta.session)).length, 10);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+
+test("direct-interaction repro: a long pause credits the hour of the prompt", () => {
+  const events = mergeEvents([{ name: "session", events: [
+    { ts: Date.parse("2026-06-01T21:14:00Z"), kind: "prompt", presence: true },
+    { ts: Date.parse("2026-06-01T21:15:00Z"), kind: "work", presence: false, reactionAnchor: true },
+    { ts: Date.parse("2026-06-01T22:24:51Z"), kind: "prompt", presence: true },
+  ] }]);
+  const split = computeRefinedSplit(events, { capMinutes: 10, promptCapMinutes: 10, timeZone: "UTC" });
+  assert.equal(split.byHour.get("2026-06-01 21:00")?.handsOn ?? 0, 0);
+  assert.equal(split.byHour.get("2026-06-01 22:00")?.handsOn ?? 0, 10);
+});
+
+test("uncapped hands-on tail sits at the end across an hour boundary", () => {
+  const events = [
+    { ts: minutes(50)[0], kind: "prompt", presence: true },
+    { ts: minutes(52)[0], kind: "work", presence: false, reactionAnchor: true },
+    { ts: minutes(70)[0], kind: "prompt", presence: true },
+  ];
+  const split = computeRefinedSplit(events, { capMinutes: 30, promptCapMinutes: 5, timeZone: "UTC" });
+  near(split.byHour.get("2026-06-01 10:00").handsOn, 0);
+  near(split.byHour.get("2026-06-01 11:00").handsOn, 5);
+});
+
+test("a tail spanning gaps ends each part at the next event, including a capped gap", () => {
+  const events = [
+    { ts: minutes(0)[0], kind: "prompt", presence: true },
+    { ts: minutes(1)[0], kind: "work", presence: false, reactionAnchor: true },
+    { ts: minutes(80)[0], kind: "work", presence: false },
+    { ts: minutes(83)[0], kind: "prompt", presence: true },
+  ];
+  const split = (a, b) => computeRefinedSplit(events, {
+    capMinutes: 10, promptCapMinutes: 10, timeZone: "UTC", rangeStartMs: minutes(a)[0], rangeEndMs: minutes(b)[0],
+  });
+  near(split(1, 73).handsOnMinutes, 0);
+  near(split(73, 80).handsOnMinutes, 7);
+  near(split(80, 83).handsOnMinutes, 3);
+});
+
+test("constructed timelines preserve all-time allocations and additive ranges for every state", () => {
+  const event = (minute, kind, extra = {}) => ({ ts: minutes(minute)[0], kind, presence: kind === "prompt", ...extra });
+  const timelines = [
+    // Gap credits 1 + 10; the ten-minute reaction exhausts the budget.
+    { events: [event(0, "prompt"), event(1, "work", { reactionAnchor: true }), event(70, "prompt")], cap: 10, budget: 10, expected: [11, 10, 0, 10, 1] },
+    // Uncapped credits 2 + 18; five minutes are direct, fifteen autonomous.
+    { events: [event(50, "prompt"), event(52, "work", { reactionAnchor: true }), event(70, "prompt")], cap: 30, budget: 5, expected: [20, 5, 0, 5, 15] },
+    // Credits 1 + 10 + 3; the tail uses 7 + 3, leaving four autonomous.
+    { events: [event(0, "prompt"), event(1, "work", { reactionAnchor: true }), event(80, "work"), event(83, "prompt")], cap: 10, budget: 10, expected: [14, 10, 0, 10, 4] },
+    // Fast reaction: eight supervised minutes plus a quarter-minute tail.
+    { events: [event(59, "prompt"), event(67, "work", { reactionAnchor: true }), event(67, "work"), event(67.25, "prompt")], cap: 10, budget: 10, expected: [8.25, 0.25, 8, 8.25, 0] },
+  ];
+  const keys = ["totalMinutes", "handsOnMinutes", "supervisedMinutes", "upperBoundMinutes", "aiAutonomousMinutes"];
+  for (const { events, cap, budget, expected } of timelines) {
+    const split = (rangeStartMs = -Infinity, rangeEndMs = Infinity) => computeRefinedSplit(events, { capMinutes: cap, promptCapMinutes: budget, timeZone: "UTC", rangeStartMs, rangeEndMs });
+    const whole = split();
+    keys.forEach((key, i) => near(whole[key], expected[i]));
+    for (const boundary of minutes(5, 60, 65, 75, 81)) {
+      const left = split(-Infinity, boundary), right = split(boundary);
+      for (const key of keys) near(left[key] + right[key], whole[key]);
+      for (const result of [whole, left, right]) {
+        assertHourInvariants(result);
+        for (const bucket of result.byHour.values()) assert.ok(bucket.total + 1e-9 >= bucket.handsOn + bucket.supervised);
+      }
+    }
+  }
+});
+
+test("a range boundary within a pause gives the tail to the range containing the prompt", () => {
+  const events = [
+    { ts: minutes(0)[0], kind: "prompt", presence: true },
+    { ts: minutes(1)[0], kind: "work", presence: false, reactionAnchor: true },
+    { ts: minutes(90)[0], kind: "prompt", presence: true },
+  ];
+  const options = { capMinutes: 10, promptCapMinutes: 10, timeZone: "UTC" };
+  const left = computeRefinedSplit(events, { ...options, rangeEndMs: minutes(60)[0] });
+  const right = computeRefinedSplit(events, { ...options, rangeStartMs: minutes(60)[0] });
+  near(left.totalMinutes, 1);
+  near(left.handsOnMinutes, 0);
+  near(right.totalMinutes, 10);
+  near(right.handsOnMinutes, 10);
+  near(cappedMinutesInRange(events.map((e) => e.ts), 10, minutes(60)[0]), 0);
 });
