@@ -10,6 +10,7 @@ import * as path from "node:path";
 import * as os from "node:os";
 import { agentEditedFiles, normalizeEditedPath } from "../edits.js";
 import { forEachJsonlRecord, isLogFileBefore } from "../jsonl.js";
+import { isRelayedPrompt } from "../core.js";
 import type { NamedSession, SessionEvent, TimelineLoadOptions } from "../core.js";
 
 export const CODEX_HOME = process.env["CODEX_HOME"] || path.join(os.homedir(), ".codex");
@@ -168,7 +169,8 @@ function parseEvents(meta: CodexSessionFile, options: TimelineLoadOptions): Sess
     // Bookkeeping often has no following human message (69 of 246 measured cases).
     if (r["type"] === "event_msg" && p["type"] === "thread_settings_applied") return;
     const input = meta.interactive ? codexHumanInput(r) : { prompt: null, presence: false };
-    const kind: SessionEvent["kind"] = input.prompt !== null ? "prompt" : "work";
+    const relayed = input.prompt !== null && isRelayedPrompt(input.prompt, options.relayPrefixes ?? []);
+    const kind: SessionEvent["kind"] = input.prompt !== null && !relayed ? "prompt" : "work";
     const item = (p["item"] ?? {}) as Record<string, unknown>;
     const reactionAnchor =
       (r["type"] === "response_item" && p["type"] === "message" && p["role"] === "assistant") ||
@@ -178,7 +180,7 @@ function parseEvents(meta: CodexSessionFile, options: TimelineLoadOptions): Sess
       (meta.interactive && r["type"] === "realtime_item" &&
         p["type"] === "transcript_segment" && p["role"] === "assistant");
     const agentEdits = agentEditedFiles(r, "codex").map((file) => normalizeEditedPath(file, meta.cwd));
-    events.push({ ts, kind, presence: input.presence, reactionAnchor, ...(agentEdits.length ? { agentEdits } : {}) });
+    events.push({ ts, kind, presence: relayed ? false : input.presence, ...(relayed ? { relayed: true as const } : {}), reactionAnchor, ...(agentEdits.length ? { agentEdits } : {}) });
   });
   events.sort((a, b) => a.ts - b.ts);
   return events;

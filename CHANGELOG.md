@@ -2,6 +2,13 @@
 
 All notable changes are documented here, following [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+
+- Configurable relay prefixes via a local JSON config, `--config`, and repeatable `--relay-prefix`; matching Claude and Codex prompts count as machine work across timing views while remaining worklog evidence.
+- Relay prefix metadata and relayed prompt counts in timing JSON, a human-readable count, and default config diagnostics in doctor.
+
 ## [0.6.0] - 2026-10-05
 
 ### Fixed

@@ -11,10 +11,13 @@ const CLI = path.join(ROOT, "dist", "cli.js");
 const CODEX_HOME = path.join(ROOT, "test", "fixtures", "codex-current");
 
 function run(args, env = {}) {
-  return spawnSync(process.execPath, [CLI, ...args], {
-    encoding: "utf8",
-    env: { ...process.env, CODEX_HOME, ...env },
-  });
+  const configHome = fs.mkdtempSync(path.join(os.tmpdir(), "ah-cli-config-"));
+  try {
+    return spawnSync(process.execPath, [CLI, ...args], {
+      encoding: "utf8",
+      env: { ...process.env, CODEX_HOME, XDG_CONFIG_HOME: configHome, ...env },
+    });
+  } finally { fs.rmSync(configHome, { recursive: true, force: true }); }
 }
 
 test("CLI worklog respects --source codex and includes Codex evidence", () => {
@@ -516,5 +519,78 @@ test("CLI timed until excludes an event exactly at the inclusive since boundary"
     assert.equal(untilLog.status, 0, untilLog.stderr);
     assert.deepEqual(JSON.parse(sinceLog.stdout).hours.flatMap((hour) => hour.prompts), ["Boundary."]);
     assert.deepEqual(JSON.parse(untilLog.stdout).hours.flatMap((hour) => hour.prompts), ["Earlier."]);
+  });
+});
+
+test("CLI applies relay flags and explicit/default config across timing views while retaining evidence", () => {
+  withReviewLogs(({ claude, codex, write, run: fixtureRun }) => {
+    const timestamp = "2026-09-05T10:00:00Z";
+    const end = "2026-09-05T10:05:00Z";
+    write(path.join(claude, "-tmp-review-project", "relay.jsonl"), [
+      { ...claudePrompt(timestamp), message: { content: "[orch] Continue." } },
+      { ...claudePrompt(end), message: { content: "[orch] Finish." } },
+    ]);
+    write(path.join(codex, "relay.jsonl"), [codexMeta("relay", timestamp),
+      { ...codexPrompt(timestamp), payload: { type: "message", role: "user", content: "[orch] Continue." } },
+      { ...codexPrompt(end), payload: { type: "message", role: "user", content: "[orch] Finish." } },
+    ]);
+    const configHome = fs.mkdtempSync(path.join(os.tmpdir(), "ah-relay-config-"));
+    try {
+      const file = path.join(configHome, "agent-hours", "config.json");
+      fs.mkdirSync(path.dirname(file));
+      fs.writeFileSync(file, JSON.stringify({ relayPrefixes: ["[orch]", "[orch]"] }));
+      const args = ["--project", "/tmp/review-project", "--timezone", "UTC"];
+      const baseline = fixtureRun([...args, "--json"]);
+      assert.equal(baseline.status, 0, baseline.stderr);
+      assert.ok(JSON.parse(baseline.stdout).attentionHours > 0);
+      assert.deepEqual(JSON.parse(baseline.stdout).relayPrefixes, []);
+      assert.equal(JSON.parse(baseline.stdout).relayedPrompts, 0);
+      for (const flags of [["--relay-prefix", "[orch]", "--relay-prefix", "[orch]"], ["--config", file, "--relay-prefix", "[other]"], []]) {
+        const effective = flags.length ? ["[orch]", ...(flags.includes("[other]") ? ["[other]"] : [])] : ["[orch]"];
+        // The empty-flags case exercises default config discovery through XDG.
+        const execute = flags.length ? (extra) => fixtureRun([...args, ...flags, ...extra])
+          : (extra) => {
+            return run([...args, ...extra], { HOME: path.dirname(path.dirname(claude)), CODEX_HOME: path.dirname(codex), XDG_CONFIG_HOME: configHome });
+          };
+        const result = execute(["--json"]);
+        assert.equal(result.status, 0, result.stderr);
+        const json = JSON.parse(result.stdout);
+        assert.deepEqual(json.relayPrefixes, effective);
+        assert.equal(json.relayedPrompts, 4);
+        assert.equal(json.prompts, 0);
+        assert.equal(json.attentionHours, 0);
+        assert.ok(json.byDay.every((day) => day.attentionHours === 0));
+        const clipped = JSON.parse(execute(["--json", "--since", "2026-09-05 10:05"]).stdout);
+        assert.equal(clipped.relayedPrompts, 2);
+        const all = JSON.parse(execute(["--all-projects", "--json"]).stdout);
+        assert.deepEqual(all.relayPrefixes, effective);
+        assert.ok(all.projects.every((project) => project.attentionHours === 0));
+        const text = execute(["--split", "--by-day"]);
+        assert.equal(text.status, 0, text.stderr);
+        assert.match(text.stdout, /Total events: 5\nRelayed prompts \(not counted as human input\): 4\n/);
+        assert.match(text.stdout, /Human attention \(model\):\s+0\.00 h/);
+        const csv = execute(["--csv", "--split"]);
+        assert.equal(csv.status, 0, csv.stderr);
+        assert.match(csv.stdout, /;0\.00;0\.00;0\.00;/);
+        const worklog = execute(["--worklog-json"]);
+        assert.equal(worklog.status, 0, worklog.stderr);
+        const hours = JSON.parse(worklog.stdout).hours;
+        assert.ok(hours.flatMap((hour) => hour.prompts).includes("[orch] Continue."));
+        for (const byDay of [[], ["--by-day"]]) {
+          const worklogCsv = execute(["--worklog", "--csv", ...byDay]);
+          assert.equal(worklogCsv.status, 0, worklogCsv.stderr);
+          assert.match(worklogCsv.stdout, byDay.length ? /;0\.00;0\.00;/ : /;0\.0;0\.0;/);
+        }
+      }
+      fs.writeFileSync(file, "{");
+      for (const result of [fixtureRun([...args, "--config", file]), run(args, { XDG_CONFIG_HOME: configHome })]) {
+        assert.equal(result.status, 1);
+        assert.ok(result.stderr.includes(file));
+        assert.match(result.stderr, /invalid JSON/);
+      }
+      const missing = fixtureRun([...args, "--config", path.join(configHome, "missing.json")]);
+      assert.equal(missing.status, 1);
+      assert.match(missing.stderr, /cannot read file/);
+    } finally { fs.rmSync(configHome, { recursive: true, force: true }); }
   });
 });

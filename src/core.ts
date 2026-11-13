@@ -23,6 +23,8 @@ export interface SessionEvent {
   presence: boolean;
   /** Session identity, attached by mergeEvents for same-session reasoning. */
   session?: string;
+  /** Prompt delivered by another agent, excluded from human input. */
+  relayed?: true;
   /** True for assistant output a later human prompt can genuinely react to. */
   reactionAnchor?: boolean;
   /** A human enqueue typed while the agent was running. */
@@ -34,6 +36,7 @@ export interface SessionEvent {
 }
 
 export interface TimelineLoadOptions {
+  relayPrefixes?: readonly string[];
   /** Skip event bodies in append-only files older than this cutoff. */
   pruneBeforeMs?: number;
   /** Mutable report of files whose event bodies were skipped. */
@@ -308,6 +311,25 @@ export function classifyRecord(record: unknown): Classified {
   return work;
 }
 
+/** Match relay prefixes after Claude's paste and image wrappers. */
+export function isRelayedPrompt(text: string, prefixes: readonly string[]): boolean {
+  const unwrapped = text.replace(/^(?:\s+|\[Image #\d+\]|<pasted_content\b[^>]*>)*/, "");
+  return prefixes.some((prefix) => unwrapped.startsWith(prefix));
+}
+
+/** Only the record's own prompt text; question answers are never relayed. */
+function claudePromptText(record: Record<string, unknown>): string | null {
+  if (claudeQuestionAnswers(record)) return null;
+  if (record["type"] === "queue-operation" && record["operation"] === "enqueue") {
+    return typeof record["content"] === "string" ? record["content"] : null;
+  }
+  const message = record["message"] as Record<string, unknown> | undefined;
+  const content = message?.["content"];
+  if (typeof content === "string") return content;
+  return Array.isArray(content) ? content.filter((item) => item?.type === "text" && typeof item.text === "string")
+    .map((item) => item.text).join("\n") : null;
+}
+
 /** Convenience wrapper: just the kind. */
 export function classifyKind(record: unknown): EventKind {
   return classifyRecord(record).kind;
@@ -348,6 +370,11 @@ export function loadSessionEvents(
       events.push({ ts, kind: "work", presence: false, reactionAnchor, ...edits });
     } else {
       const c = classifyRecord(record);
+      const promptText = c.kind === "prompt" ? claudePromptText(record) : null;
+      if (promptText !== null && isRelayedPrompt(promptText, options.relayPrefixes ?? [])) {
+        events.push({ ts, kind: "work", presence: false, relayed: true, reactionAnchor, ...edits });
+        return;
+      }
       const midTurn = c.kind === "prompt" && record["type"] === "queue-operation";
       events.push({ ts, kind: c.kind, presence: c.presence, reactionAnchor, ...edits, ...(midTurn ? { midTurn: true } : {}) });
     }

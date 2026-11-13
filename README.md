@@ -106,6 +106,8 @@ npx agent-hours --source claude|codex|auto # default auto: merge all agents
 npx agent-hours --all-projects --source auto --split
 
 # tuning & debugging
+npx agent-hours --config ./agent-hours.json
+npx agent-hours --relay-prefix "[orch]"     # repeatable; adds to config prefixes
 npx agent-hours --cap 10 --prompt-cap 10 --timezone Europe/Berlin
 npx agent-hours --tz-offset 2                 # fixed-offset compatibility mode
 npx agent-hours --by-session               # parallel sessions, per-file
@@ -114,6 +116,18 @@ npx agent-hours --pauses --top-pauses <n>  # number of pauses to list
 ```
 
 When hours look wrong or after an agent update, run `agent-hours doctor`. It reports source sizes, retention risk, unfamiliar record kinds, and possible passive records without printing prompts, log content, or project paths. The read-only canary checks files modified in the last 14 days, stops at 400 MB, and exits successfully even with warnings.
+
+## Configuration
+
+Relay prefixes mark prompts delivered by another agent. Set them in `$XDG_CONFIG_HOME/agent-hours/config.json`, or `~/.config/agent-hours/config.json` when `XDG_CONFIG_HOME` is unset or empty:
+
+```json
+{
+  "relayPrefixes": ["[orch]"]
+}
+```
+
+Use `--config <file>` to choose another file and repeat `--relay-prefix <text>` to add prefixes. Prefixes are combined and deduplicated. Matching is exact and case-sensitive at the start of prompt text, after whitespace, image markers, and opening paste wrappers. Missing default configuration means no prefixes; an explicit missing file or invalid configuration is an error. Relayed prompts remain worklog topic evidence; their timeline events count as machine work without human presence. Doctor reports the default configuration status.
 
 ## Methodology
 
@@ -129,7 +143,7 @@ Credited time is placed immediately after the earlier event, up to the next even
 
 What you bill is your decision; the tool gives you the evidence and the band.
 
-Classification details verified against current and legacy logs: scheduled-task, SDK, hook, command-envelope, and task-notification records are filtered out; queued messages are credited at the moment you *typed* them; compact-continuation summaries don't count; and Claude/Codex subagent plus Codex `exec` and `mcp` sessions count entirely as machine work. Multipart Codex messages keep their human text while dropping injected context blocks. Codex voice input and question replies, plus Claude `AskUserQuestion` answers, count as human input. Claude `away_summary` and Codex `thread_settings_applied` are excluded from timing: they can arrive after departure and pad pauses. Away summaries remain available as worklog evidence.
+Classification details verified against current and legacy logs: scheduled-task, SDK, hook, command-envelope, and task-notification records are filtered out; queued messages are credited at the moment you *typed* them; compact-continuation summaries don't count; and Claude/Codex subagent plus Codex `exec` and `mcp` sessions count entirely as machine work. Multipart Codex messages keep their human text while dropping injected context blocks. Codex voice input and question replies, plus Claude `AskUserQuestion` answers, count as human input. Claude `away_summary` and Codex `thread_settings_applied` are excluded from timing: they can arrive after departure and pad pauses. Away summaries remain available as worklog evidence. Prompts matching configured relay prefixes count as machine work without human presence.
 
 ## Sources
 
@@ -139,7 +153,7 @@ Classification details verified against current and legacy logs: scheduled-task,
 | Codex CLI | ✅ | `$CODEX_HOME/sessions/**.jsonl` + `$CODEX_HOME/archived_sessions/**.jsonl` (default home: `~/.codex`, matched via `cwd`, deduplicated by session ID and continuation segment) |
 | Gemini CLI, opencode, Cursor, Aider | planned | see adapter notes below |
 
-Adapter contract: `{ts, kind: prompt|work, presence, reactionAnchor, editedPath?, agentEdits?}` events in `src/sources/`, plus worklog extraction in `src/worklog.ts` and wiring in `src/cli.ts`. The Claude Code adapter currently lives in `src/core.ts`; adapters return events inside `NamedSession[]`, and merging attaches session identity. PRs welcome.
+Adapter contract: `{ts, kind: prompt|work, presence, reactionAnchor, editedPath?, agentEdits?, relayed?}` events in `src/sources/`, plus worklog extraction in `src/worklog.ts` and wiring in `src/cli.ts`. The Claude Code adapter currently lives in `src/core.ts`; adapters return events inside `NamedSession[]`, and merging attaches session identity. PRs welcome.
 
 Sessions started in subdirectories of the project are included for both Claude and Codex. `--all-projects` groups Claude files by their own canonical `cwd`, with subagents following their parent; files without `cwd` are grouped under their log directory. Claude workflow subagents below `subagents/workflows/wf_*/` count as machine work. Codex long threads can span continuation files (`history_base`); unique segments merge using the base thread’s classification, and archived copies count once.
 

@@ -7,6 +7,7 @@
  * Data source: local Claude and Codex JSONL transcripts (retroactive, zero
  * setup — nothing leaves your machine unless --summarize is requested).
  */
+import { loadConfig } from "./config.js";
 import { collectDoctor, formatDoctor } from "./doctor.js";
 import { parseArgs } from "node:util";
 import { spawnSync } from "node:child_process";
@@ -83,6 +84,8 @@ Usage:
 
 Options:
   --project <path|hash>  project to analyze (default: cwd)
+  --config <file>       read configuration from this file
+  --relay-prefix <text>  exclude relayed prompts with this prefix (repeatable)
   --source <s>           auto | claude | codex (default: auto — merges all
                          agents into ONE timeline, no double counting)
   --summarize            refine worklog descriptions via \`claude -p\`
@@ -222,6 +225,8 @@ async function main(): Promise<void> {
     const parsed = parseArgs({
       allowPositionals: true,
       options: {
+        config: { type: "string" },
+        "relay-prefix": { type: "string", multiple: true },
         project: { type: "string" },
         source: { type: "string", default: "auto" },
         summarize: { type: "boolean", default: false },
@@ -302,6 +307,8 @@ async function main(): Promise<void> {
     return;
   }
 
+  const relayPrefixes = [...new Set([...loadConfig(args.config).relayPrefixes, ...(args["relay-prefix"] ?? [])])];
+
   const cap = Number(args.cap);
   const promptCap = Number(args["prompt-cap"]);
   const topPauses = Number(args["top-pauses"]);
@@ -343,6 +350,7 @@ async function main(): Promise<void> {
   // reaction weight are exact; only the proportional supervised share of a
   // window that began in a pruned file can differ.
   const loadOptions: TimelineLoadOptions = {
+    relayPrefixes,
     ...(args.since ? { pruneBeforeMs: sinceMs - 24 * 3600_000 } : {}),
     stats: { prunedFiles: 0 },
   };
@@ -444,7 +452,7 @@ async function main(): Promise<void> {
     return;
   }
   if (args.json) {
-    printJson(projectDir, args, rangeSessions, merged, refined, cap, promptCap, timeZone, overlapping, sinceMs, untilMs, openStart);
+    printJson(projectDir, args, rangeSessions, merged, refined, cap, promptCap, timeZone, overlapping, sinceMs, untilMs, openStart, relayPrefixes);
     return;
   }
   if (args.csv) {
@@ -463,6 +471,8 @@ async function main(): Promise<void> {
     console.log(`Claude project directories matched (root + descendants): ${claudeProjectDirs.length}`);
   }
   console.log(`Total events: ${inRange.length.toLocaleString("en-US")}`);
+  const relayedPrompts = inRange.filter((event) => event.relayed).length;
+  if (relayedPrompts > 0) console.log(`Relayed prompts (not counted as human input): ${relayedPrompts}`);
   console.log();
   console.log("Activity at different idle caps:");
   console.log(`  ${"Cap".padEnd(8)} ${"with cap bonus".padEnd(16)} ${"strict (pause>cap=0)".padEnd(22)}`);
@@ -861,7 +871,8 @@ function printJson(
   overlapping: boolean,
   sinceMs: number,
   untilMs: number,
-  openStart: boolean
+  openStart: boolean,
+  relayPrefixes: readonly string[],
 ): void {
   const allTimes = merged.map((e) => e.ts);
   const days = aggregateDays(refined);
@@ -887,6 +898,8 @@ function printJson(
     JSON.stringify(
       {
         projectDir,
+        relayPrefixes,
+        relayedPrompts: merged.filter((event) => event.relayed && event.ts >= sinceMs && event.ts < untilMs).length,
         since: args.since ?? null,
         until: args.until ?? null,
         capMinutes: cap,
@@ -1028,6 +1041,7 @@ function runAllProjects(
           capMinutes: cap,
           promptCapMinutes: promptCap,
           source,
+          relayPrefixes: loadOptions.relayPrefixes ?? [],
           timeZone: typeof timeZone === "string" ? timeZone : null,
           tzOffsetHours: typeof timeZone === "number" ? timeZone : null,
           totalHours: +(grand.totalMinutes / 60).toFixed(2),

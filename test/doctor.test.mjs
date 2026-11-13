@@ -11,6 +11,8 @@ const stamp = (minutes) => new Date(Date.now() - (60 - minutes) * 60000).toISOSt
 
 function fixture(callback) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "ah-doctor-"));
+  const configHome = path.join(home, "config");
+  fs.mkdirSync(configHome);
   const codexHome = path.join(home, ".codex");
   const project = path.join(home, ".claude", "projects", "project-1");
   const sessions = path.join(codexHome, "sessions");
@@ -28,9 +30,9 @@ function fixture(callback) {
     { type: "response_item", timestamp: stamp(1), payload: { type: "message", role: "user", content: "Private Codex prompt." } },
   ]);
   const run = (args = [], extra = {}) => spawnSync(process.execPath, [CLI, "doctor", ...args], {
-    encoding: "utf8", env: { ...process.env, HOME: home, CODEX_HOME: codexHome, PATH: home, ...extra },
+    encoding: "utf8", env: { ...process.env, HOME: home, XDG_CONFIG_HOME: configHome, CODEX_HOME: codexHome, PATH: home, ...extra },
   });
-  try { callback({ home, project, sessions, write, run }); }
+  try { callback({ home, configHome, project, sessions, write, run }); }
   finally { fs.rmSync(home, { recursive: true, force: true }); }
 }
 
@@ -280,5 +282,32 @@ test("doctor treats a bare subagent source as machine work without unknown-sourc
     assert.equal(report.status, "doctor: OK");
     // A human-shaped message after a long gap stays a passive candidate.
     assert.deepEqual(report.passiveCandidates, [{ kind: "codex:response_item|message|", count: 1 }]);
+  });
+});
+
+test("doctor reports default config status and survives invalid config without prompt content", () => {
+  fixture(({ configHome, run }) => {
+    const file = path.join(configHome, "agent-hours", "config.json");
+    const missing = JSON.parse(run(["--json"]).stdout).config;
+    assert.equal(missing.exists, false);
+    assert.deepEqual(missing.relayPrefixes, []);
+    assert.equal(missing.error, null);
+    assert.ok(missing.path.endsWith("/agent-hours/config.json"));
+    fs.mkdirSync(path.dirname(file));
+    fs.writeFileSync(file, JSON.stringify({ relayPrefixes: ["[orch]"] }));
+    const valid = JSON.parse(run(["--json"]).stdout).config;
+    assert.equal(valid.exists, true);
+    assert.deepEqual(valid.relayPrefixes, ["[orch]"]);
+    assert.equal(valid.error, null);
+    assert.match(run().stdout, /Config: .*exists=true; 1 relay prefixes/);
+    fs.writeFileSync(file, '{"relayPrefixes": ["Private prompt content."],');
+    const result = run(["--json", "--config", "ignored.json"]);
+    assert.equal(result.status, 0, result.stderr);
+    const broken = JSON.parse(result.stdout).config;
+    assert.equal(broken.exists, true);
+    assert.deepEqual(broken.relayPrefixes, []);
+    assert.match(broken.error, /config.json: invalid JSON/);
+    assert.match(run().stdout, /Config: .*invalid JSON/);
+    assert.doesNotMatch(result.stdout, /Private prompt content/);
   });
 });

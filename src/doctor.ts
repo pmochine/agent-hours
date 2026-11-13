@@ -1,4 +1,5 @@
 /** Read-only diagnostics. Never retain or print prompts, content, or project paths. */
+import { defaultConfigPath, loadConfig } from "./config.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
@@ -49,6 +50,10 @@ function binaryVersion(binary: string): string | null {
 }
 
 export function collectDoctor(now = Date.now()) {
+  const configPath = defaultConfigPath();
+  const config = { path: displayPath(configPath), exists: fs.existsSync(configPath), relayPrefixes: [] as string[], error: null as string | null };
+  try { config.relayPrefixes = loadConfig().relayPrefixes; }
+  catch (error) { config.error = (error as Error).message.replaceAll(os.homedir(), "~"); }
   const files: LogFile[] = [];
   const unsupported = new Map<string, number>();
   let nestedSubagentDirectories = 0;
@@ -186,12 +191,12 @@ export function collectDoctor(now = Date.now()) {
   if (unsupported.size) warnings.push("Compressed or unknown Codex files: not read.");
   if (unreadableFiles) warnings.push("The streaming reader could not read files.");
   if (inventoryFailures) warnings.push("Some source entries could not be inspected.");
-  return { sources, retention, scan, structure, passiveCandidates: counted(passive).slice(0, 5), warnings,
+  return { config, sources, retention, scan, structure, passiveCandidates: counted(passive).slice(0, 5), warnings,
     status: warnings.length ? `doctor: ${warnings.length} warnings` : "doctor: OK" };
 }
 
 export function formatDoctor(report: ReturnType<typeof collectDoctor>): string {
-  const lines = ["Sources:"];
+  const lines = [`Config: ${report.config.path}; exists=${report.config.exists}; ${report.config.error ?? `${report.config.relayPrefixes.length} relay prefixes`}`, "Sources:"];
   for (const [name, source] of [ ["Claude projects", report.sources.claude], ["Codex sessions", report.sources.codexSessions], ["Codex archived sessions", report.sources.codexArchivedSessions] ] as const) {
     lines.push(`  ${name}: ${source.directory}; exists=${source.exists}; ${source.projectDirectories === undefined ? "" : `${source.projectDirectories} project directories; `}${source.files} files; ${source.bytes} bytes`);
   }
