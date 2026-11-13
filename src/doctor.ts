@@ -7,7 +7,7 @@ import { spawnSync } from "node:child_process";
 import { PROJECTS_BASE, classifyRecord, isClaudeSubagentFile } from "./core.js";
 import { CODEX_HOME, defaultCodexSessionDirs, codexHumanInput, classifyCodexSessionMeta } from "./sources/codex.js";
 import { checkRetention } from "./install.js";
-import { forEachJsonlRecord, unreadableFileCount } from "./jsonl.js";
+import { forEachJsonlRecord, unreadableFileCount, supportsZstd } from "./jsonl.js";
 import {
   schemaKind, schemaValue, KNOWN_CLAUDE_KINDS, KNOWN_CODEX_KINDS,
   KNOWN_PROMPT_SOURCES, KNOWN_ORIGINATORS, KNOWN_CODEX_SOURCES,
@@ -82,7 +82,7 @@ export function collectDoctor(now = Date.now()) {
         } else if (entry.isFile()) {
           try {
             const stat = fs.statSync(file);
-            if (entry.name.endsWith(".jsonl")) {
+            if (entry.name.endsWith(".jsonl") || (source === "codex" && supportsZstd && entry.name.endsWith(".jsonl.zst"))) {
               info.files++;
               info.bytes += stat.size;
               files.push({ file, source, size: stat.size, mtimeMs: stat.mtimeMs });
@@ -129,7 +129,8 @@ export function collectDoctor(now = Date.now()) {
     filesScanned++;
     const bytesBefore = bytesRead;
     const fileBudget = Math.min(fileSampleBytes, READ_LIMIT - bytesRead);
-    if (file.size > fileBudget) sampledFiles++;
+    const compressed = file.file.endsWith(".zst");
+    if (!compressed && file.size > fileBudget) sampledFiles++;
     let previousTs: number | null = null;
     let interactive = true;
     let subagent = file.source === "claude" && isClaudeSubagentFile(file.file, path.join(PROJECTS_BASE, path.relative(PROJECTS_BASE, file.file).split(path.sep)[0]));
@@ -167,7 +168,9 @@ export function collectDoctor(now = Date.now()) {
       previousTs = ts;
     }, { maxBytes: fileBudget, onBytesRead: (size) => { bytesRead += size; } });
     // Only complete files establish the absence of a later human prompt.
-    if (bytesRead - bytesBefore >= file.size) {
+    const consumed = bytesRead - bytesBefore;
+    if (compressed && consumed >= fileBudget) sampledFiles++;
+    if (compressed ? consumed < fileBudget : consumed >= file.size) {
       for (const candidate of pending) increment(passive, candidate.kind);
     }
     if (historyBase) historyBaseFiles++;
@@ -188,7 +191,8 @@ export function collectDoctor(now = Date.now()) {
   if (originators.size) warnings.push("Unknown Codex originator values.");
   if (codexSources.size) warnings.push("Unknown Codex source values.");
   if (nestedSubagentDirectories) warnings.push("Unexpected nested subagent directories.");
-  if (unsupported.size) warnings.push("Compressed or unknown Codex files: not read.");
+  if (unsupported.size) warnings.push("Compressed or unknown Codex files: not read." +
+    (unsupported.has("*.jsonl.zst") ? " Reading *.jsonl.zst needs Node >= 22.15." : ""));
   if (unreadableFiles) warnings.push("The streaming reader could not read files.");
   if (inventoryFailures) warnings.push("Some source entries could not be inspected.");
   return { config, sources, retention, scan, structure, passiveCandidates: counted(passive).slice(0, 5), warnings,

@@ -36,7 +36,7 @@ import {
   type TimeZoneSpec,
   type TimelineLoadOptions,
 } from "./core.js";
-import { unreadableFileCount } from "./jsonl.js";
+import { unreadableFileCount, compressedSkippedFileCount } from "./jsonl.js";
 import {
   WORKLOG_LLM_TEMPLATE,
   collectCodexWorklog,
@@ -1199,6 +1199,7 @@ function runAllProjects(
 }
 
 process.on("exit", () => {
+  if (compressedSkippedFileCount > 0) console.error(`warning: ${compressedSkippedFileCount} compressed Codex logs were skipped; reading *.jsonl.zst needs Node >= 22.15`);
   if (!doctorCommand && unreadableFileCount > 0) console.error(`warning: ${unreadableFileCount} log files could not be read`);
 });
 main().catch((e) => fail((e as Error).message));

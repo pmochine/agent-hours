@@ -47,7 +47,7 @@ function walkJsonl(dir: string, out: string[] = []): string[] {
   for (const e of entries) {
     const p = path.join(dir, e.name);
     if (e.isDirectory()) walkJsonl(p, out);
-    else if (e.isFile() && e.name.endsWith(".jsonl")) out.push(p);
+    else if (e.isFile() && (e.name.endsWith(".jsonl") || e.name.endsWith(".jsonl.zst"))) out.push(p);
   }
   return out;
 }
@@ -87,10 +87,12 @@ function readMeta(file: string): CodexSessionFile | null {
     return meta;
   };
   let rec: Record<string, unknown> | null = null;
+  // Stop at the first object, not the first physical line: blank/malformed
+  // lines remain skippable. An explicit budget enables lazy zstd prefixes.
   forEachJsonlRecord(file, (record) => {
     if (record["type"] === "session_meta") rec = record;
     return false;
-  }, { chunkSize: 64 * 1024 });
+  }, { chunkSize: 64 * 1024, maxLines: Infinity });
   if (!rec) return remember(null);
   const record = rec as Record<string, unknown>;
   const payload = (record["payload"] ?? {}) as Record<string, unknown>;
@@ -198,15 +200,16 @@ function scanCodexMetadata(
 ): Map<string, CodexSessionFile[]> {
   const seenIds = new Set<string>();
   const files: CodexSessionFile[] = [];
-  for (const dir of baseDirs(baseDir)) {
-    for (const file of walkJsonl(dir).sort()) {
-      const meta = readMeta(file);
-      if (!meta) continue;
-      const dedupeKey = JSON.stringify([meta.sessionId ?? canonicalProjectPath(file), meta.historyBaseEndOrdinal]);
-      if (seenIds.has(dedupeKey)) continue;
-      seenIds.add(dedupeKey);
-      files.push(meta);
-    }
+  // Prefer plain copies across both locations, then active over archived.
+  const candidates = baseDirs(baseDir).flatMap((dir) => walkJsonl(dir).sort())
+    .sort((a, b) => Number(a.endsWith(".zst")) - Number(b.endsWith(".zst")));
+  for (const file of candidates) {
+    const meta = readMeta(file);
+    if (!meta) continue;
+    const dedupeKey = JSON.stringify([meta.sessionId ?? canonicalProjectPath(file), meta.historyBaseEndOrdinal]);
+    if (seenIds.has(dedupeKey)) continue;
+    seenIds.add(dedupeKey);
+    files.push(meta);
   }
   // Continuations contain only new records. Use the base thread's source for all segments.
   const threads = groupSegments(files);
@@ -239,7 +242,7 @@ function baseSegment(segments: CodexSessionFile[]): CodexSessionFile {
     [...segments].sort((a, b) => a.historyBaseEndOrdinal! - b.historyBaseEndOrdinal!)[0];
 }
 
-/** Merge each thread's unique segments, preferring active over archived copies. */
+/** Merge each thread's unique segments, preferring plain copies, then active over archived. */
 export function scanCodexSessions(
   options: TimelineLoadOptions = {},
   baseDir?: CodexSessionBase,

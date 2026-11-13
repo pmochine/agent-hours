@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import * as zlib from "node:zlib";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
@@ -101,8 +102,10 @@ test("doctor checks retention, nested workflows, continuations, unsupported file
     fs.writeFileSync(path.join(sessions, "other.bin"), "Unread unknown fixture.");
     report = JSON.parse(run(["--json"]).stdout);
     assert.equal(report.structure.nestedSubagentDirectories, 1);
-    assert.deepEqual(report.structure.unsupportedFiles, [{ kind: "*.jsonl.zst", count: 1 }, { kind: ".bin", count: 1 }]);
-    assert.equal(report.warnings.length, 3);
+    const capable = typeof zlib.zstdDecompressSync === "function";
+    assert.deepEqual(report.structure.unsupportedFiles, capable ? [{ kind: ".bin", count: 1 }] : [{ kind: "*.jsonl.zst", count: 1 }, { kind: ".bin", count: 1 }]);
+    assert.equal(report.structure.unreadableFiles, capable ? 1 : 0);
+    assert.equal(report.warnings.length, capable ? 4 : 3);
   });
 });
 

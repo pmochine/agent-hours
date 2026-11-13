@@ -4,6 +4,10 @@ All notable changes are documented here, following [Keep a Changelog](https://ke
 
 ## [Unreleased]
 
+### Fixed
+
+- Read zstd-compressed Codex rollouts in active and archived sessions, restoring their time, prompts, and worklog evidence. Prefer plain copies when both exist. Doctor includes compressed logs on Node >= 22.15; older runtimes warn and skip them.
+
 ### Changed
 
 - Identify clients and fields in configuration errors while keeping doctor anonymous, align client text tables, and include configured projects without sessions as zero-attention JSON entries.

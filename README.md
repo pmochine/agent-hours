@@ -169,21 +169,21 @@ Classification details verified against current and legacy logs: scheduled-task,
 | Agent | Status | Logs read from |
 |---|---|---|
 | Claude Code | ✅ | `~/.claude/projects/<hash>/*.jsonl` + `<session>/subagents/` |
-| Codex CLI | ✅ | `$CODEX_HOME/sessions/**.jsonl` + `$CODEX_HOME/archived_sessions/**.jsonl` (default home: `~/.codex`, matched via `cwd`, deduplicated by session ID and continuation segment) |
+| Codex CLI | ✅ | `$CODEX_HOME/sessions/` + `$CODEX_HOME/archived_sessions/` (`*.jsonl` and `*.jsonl.zst`, recursively; default home: `~/.codex`, matched via `cwd`, deduplicated by session ID and continuation segment) |
 | Gemini CLI, opencode, Cursor, Aider | planned | see adapter notes below |
 
 Adapter contract: `{ts, kind: prompt|work, presence, reactionAnchor, editedPath?, agentEdits?, relayed?}` events in `src/sources/`, plus worklog extraction in `src/worklog.ts` and wiring in `src/cli.ts`. The Claude Code adapter currently lives in `src/core.ts`; adapters return events inside `NamedSession[]`, and merging attaches session identity. PRs welcome.
 
 Sessions started in subdirectories of the project are included for both Claude and Codex. `--all-projects` groups Claude files by their own canonical `cwd`, with subagents following their parent; files without `cwd` are grouped under their log directory. Claude workflow subagents below `subagents/workflows/wf_*/` count as machine work. Codex long threads can span continuation files (`history_base`); unique segments merge using the base thread’s classification, and archived copies count once.
 
-Logs are read as streams, so large transcripts do not need to fit in memory. `--since` skips event bodies in files whose modification times predate its context window, speeding up recent reports; old Codex base metadata is still read to classify continuations. After pruning, the first loaded prompt gets a window from the first loaded event: the direct-interaction tail and reaction weight remain exact, while the proportional supervised share of a window that began in a pruned file can differ. Doctor flags schema drift and unreadable or unsupported files before you rely on a report.
+Plain JSONL logs are read as streams, so large transcripts do not need to fit in memory. Compressed Codex rollouts (`*.jsonl.zst`) are decompressed in memory and require Node >= 22.15; older Node versions warn and skip them. Metadata reads and the doctor canary use growing compressed prefixes and count their read budgets in decompressed bytes. `--since` skips event bodies in files whose modification times predate its context window, speeding up recent reports; old Codex base metadata is still read to classify continuations. After pruning, the first loaded prompt gets a window from the first loaded event: the direct-interaction tail and reaction weight remain exact, while the proportional supervised share of a window that began in a pruned file can differ. Doctor flags schema drift and unreadable or unsupported files before you rely on a report.
 
 ## Retroactive use & log retention
 
 Everything works retroactively — **as long as the logs are still on disk**:
 
 - **Claude Code** prunes old transcripts after `cleanupPeriodDays` (default: **30 days**). For billing you almost certainly want more. `npx agent-hours install` checks this for you and offers to raise it to 365 days (or set it yourself in `~/.claude/settings.json`: `{"cleanupPeriodDays": 365}`). Do it *before* you need last quarter's hours — once a transcript is pruned, it's gone.
-- **Codex CLI** sessions can be active or archived. `agent-hours` reads both locations as long as the JSONL files are still present on disk.
+- **Codex CLI** sessions can be active or archived. `agent-hours` reads plain and zstd-compressed JSONL rollouts in both locations as long as the files are still present on disk.
 
 The `install` command never changes your settings silently: in an interactive terminal it asks first; when an agent runs it, it only prints the recommendation. Use `--set-retention` to apply it non-interactively or `--no-retention` to skip the check.
 
