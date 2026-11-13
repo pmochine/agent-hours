@@ -1,0 +1,7 @@
+All projects (cap 10min):
+
+    Hours  Events  Last        Project
+    0.23h      11  2026-06-02  /tmp/proj-current
+    0.02h       3  2026-06-02  /tmp/proj-current/sub
+
+  2 projects, 0.28 h merged wall-clock activity.

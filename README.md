@@ -52,6 +52,7 @@ Existing tools don't answer this:
 - **Descriptions with or without AI** — rule-based summaries are the default (deterministic, free, reproducible). `--summarize` optionally refines them via `claude -p` — the only feature that costs API money, strictly opt-in. It is also the only feature that sends data off the machine: prompt excerpts, file paths, commit messages, away-summary excerpts and Codex final-answer excerpts go to Claude via `claude -p`. Or pipe `--worklog-json` into the AI chat you're already paying for.
 - **Exports** — CSV (hours/days, with description column and project total row; English headers by default, `--lang de` for German headers), JSON, markdown worklog.
 - **Regression-tested timekeeping core** — merged-timeline idle-cap math, parallel-session detection, pause analysis, cap-bonus vs. strict columns, per-session breakdown.
+- **Client attention across repositories** — union each client’s projects, then proportionally cap all billable clients together at 60 minutes per clock hour; export daily or hourly evidence.
 - **All projects at a glance** — `--all-projects` ranks everything on your machine.
 
 ## Install (pick your comfort level)
@@ -83,6 +84,11 @@ From then on, questions like *"What did I work on this week?"* or *"Export a CSV
 
 ```bash
 npx agent-hours install [claude|codex|all] # install the skill for selected agents
+npx agent-hours clients            # client attention with proportional hourly billing cap
+npx agent-hours clients --client acme --json # filter output; cap still includes all clients
+npx agent-hours clients --by-day   # daily client breakdown
+npx agent-hours clients --by-hour  # hourly attention, cap factor, and deduction
+npx agent-hours clients --csv      # daily CSV (or --by-hour for hourly CSV)
 npx agent-hours doctor             # check sources, retention, and schema
 npx agent-hours doctor --json      # the same diagnostics as JSON
 npx agent-hours                    # current project, hours at several idle caps
@@ -123,11 +129,22 @@ Relay prefixes mark prompts delivered by another agent. Set them in `$XDG_CONFIG
 
 ```json
 {
-  "relayPrefixes": ["[orch]"]
+  "relayPrefixes": ["[orch]"],
+  "clients": {
+    "acme": { "projects": ["~/code/acme-shop", { "path": "~/code/acme", "descendants": false }] },
+    "globex": { "projects": ["~/code/globex-api"] },
+    "own": { "billable": false, "projects": ["~/code/blog"] }
+  }
 }
 ```
 
 Use `--config <file>` to choose another file and repeat `--relay-prefix <text>` to add prefixes. Prefixes are combined and deduplicated. Matching is exact and case-sensitive at the start of prompt text, after whitespace, image markers, and opening paste wrappers. Missing default configuration means no prefixes; an explicit missing file or invalid configuration is an error. Relayed prompts remain worklog topic evidence; their timeline events count as machine work without human presence. Doctor reports the default configuration status.
+
+Each client has a non-empty `projects` array and an optional `billable` boolean (default `true`). Project entries are path strings or `{ "path": "...", "descendants": false }` objects. Paths must be absolute after expanding a leading `~` or `~/`; symlinks and Unicode normalization are resolved for comparison. Unknown keys, empty client names, and duplicate canonical paths (even within one client) are errors.
+
+A project belongs to the **longest matching path**. Entries include descendants by default; `descendants: false` matches only the exact cwd. A more specific entry wins over its parent. Claude logs without a known cwd cannot be assigned. Repositories with attention but no matching client appear as unassigned in JSON and as a count in the text footer.
+
+`agent-hours clients` requires configured clients. It supports the shared range, cap, timezone, source, relay, and export options. `--client <name>` filters only the output: the hourly cap always includes all billable clients. `--by-day` shows daily rows; `--by-hour` shows hourly rows with cap factors. CSV is daily by default and hourly with `--by-hour`; `--lang de` localizes its headers. JSON includes project shares, days, hours, other billable clients sharing a capped hour, and unassigned projects. Client mode does not support `--project`, `--all-projects`, `--split`, `--by-session`, worklogs, summaries, or pauses.
 
 ## Methodology
 
@@ -140,6 +157,8 @@ Credited time is placed immediately after the earlier event, up to the next even
 - **Direct interaction** — capped reaction tails between the latest assistant output in the same session and your next prompt. If two prompts arrive without an answer between them, the earlier prompt is the fallback anchor. This estimates time spent reading, thinking, or typing; it does not prove continuous work throughout the tail.
 - **Supervised** — the agent-working part of each prompt window, weighted by same-session watch evidence: you reacted within 30 s afterwards (you were watching) ⇒ 100 %, within 5 min ⇒ 50 %, slower ⇒ 0 %. Hard presence proof in that session — you typed a queued message mid-turn, or an external file change was noticed while the agent ran — forces 100 %. An edited-file notice only qualifies if no other session (including a subagent) edited the same normalized path in the preceding 30 minutes.
 - **AI autonomous** — the rest of agent runtime.
+
+**Client view** merges all sessions of a client into one timeline and measures its attention as direct interaction plus supervised time. Overlapping wall-clock minutes across that client's repositories count once. Standalone project attention supplies weights to distribute the client's hourly attention across its repositories; if those weights are zero, standalone activity is used, then equal shares. For each clock hour, attention across all billable clients above 60 minutes is reduced proportionally to 60 minutes. Day and range values sum the hourly values. The 60-minute cap also applies to clipped boundary hours and each separate repeated DST hour. Non-billable clients retain their attention estimates, contribute nothing to this cap, and have no overlap deduction or billable time. This manual 60-minute cap is a billing rule, not a measurement of human attention.
 
 What you bill is your decision; the tool gives you the evidence and the band.
 
@@ -180,7 +199,7 @@ Rule of thumb: run exports when you invoice and archive the CSV/JSON next to the
 ## Roadmap
 
 - **Manual entries** — calls and research that agent logs cannot see.
-- **Client profiles** — several repositories under one rate.
+- **Client rates** — rates for the existing cross-repository client profiles.
 - **`--rate`** — money columns for invoice exports.
 - **`--by-week` / `--by-month`** — grouping for retainer billing.
 - **“Billed until” cutoff** — start the next invoice where the previous one ended.

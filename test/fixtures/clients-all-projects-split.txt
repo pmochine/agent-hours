@@ -1,0 +1,7 @@
+All projects (cap 10min) — with split:
+
+    Hours    Attn  AI-auto  Last        Project
+    0.23h   0.00h    0.23h  2026-06-02  /tmp/proj-current
+    0.02h   0.00h    0.02h  2026-06-02  /tmp/proj-current/sub
+
+  2 projects, 0.28 h merged wall-clock activity.

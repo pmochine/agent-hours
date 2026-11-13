@@ -594,3 +594,122 @@ test("CLI applies relay flags and explicit/default config across timing views wh
     } finally { fs.rmSync(configHome, { recursive: true, force: true }); }
   });
 });
+
+function withClientLogs(callback) {
+  withReviewLogs(({ claude, codex, write, run: fixtureRun }) => {
+    for (const cwd of ["/tmp/acme/shop", "/tmp/globex/api", "/tmp/own", "/tmp/unassigned"]) {
+      const name = cwd.replaceAll("/", "-");
+      write(path.join(claude, name, "session.jsonl"), [0, 10, 20, 30, 40].map((minute) => claudePrompt(`2026-10-01T10:${String(minute).padStart(2, "0")}:00Z`, cwd)));
+    }
+    write(path.join(claude, "legacy", "session.jsonl"), [0, 10].map((minute) => ({ type: "user", timestamp: `2026-10-01T10:${String(minute).padStart(2, "0")}:00Z`, promptSource: "typed", message: { content: "Continue." } })));
+    const file = path.join(path.dirname(codex), "clients.json");
+    const config = { clients: { acme: { projects: ["/tmp/acme"] }, globex: { projects: ["/tmp/globex"] }, own: { billable: false, projects: ["/tmp/own"] } } };
+    fs.writeFileSync(file, JSON.stringify(config));
+    const base = ["clients", "--config", file, "--timezone", "UTC", "--since", "2026-10-01", "--until", "2026-10-01"];
+    callback({ execute: (args) => fixtureRun([...base, ...args]), fixtureRun, file, config });
+  });
+}
+
+test("clients JSON reports capped attention, shares, peers and unassigned repositories", () => {
+  withClientLogs(({ execute }) => {
+    const result = execute(["--json"]);
+    assert.equal(result.status, 0, result.stderr);
+    const json = JSON.parse(result.stdout);
+    assert.deepEqual(Object.keys(json), ["since", "until", "capMinutes", "promptCapMinutes", "hourlyCapMinutes", "timeZone", "tzOffsetHours", "source", "relayPrefixes", "clients", "unassigned"]);
+    assert.equal(json.since, "2026-10-01"); assert.equal(json.until, "2026-10-01");
+    assert.equal(json.capMinutes, 10); assert.equal(json.promptCapMinutes, 10); assert.equal(json.hourlyCapMinutes, 60);
+    assert.equal(json.timeZone, "UTC"); assert.equal(json.tzOffsetHours, null); assert.equal(json.source, "auto"); assert.deepEqual(json.relayPrefixes, []);
+    for (const client of json.clients.slice(0, 2)) {
+      assert.equal(client.billable, true); assert.equal(client.totalHours, 0.67); assert.equal(client.aiAutonomousHours, 0);
+      assert.equal(client.attentionHours, 0.67); assert.equal(client.overlapHours, 0.17); assert.equal(client.billableHours, 0.5);
+      const project = client.name === "acme" ? "/tmp/acme/shop" : "/tmp/globex/api";
+      assert.deepEqual(client.projects, [{ project, attentionHours: 0.67 }]);
+      assert.deepEqual(client.byDay, [{ date: "2026-10-01", attentionHours: 0.67, overlapHours: 0.17, billableHours: 0.5 }]);
+      assert.deepEqual(client.byHour, [{ hour: "2026-10-01 10:00", attentionMinutes: 40, capFactor: 0.75, overlapMinutes: 10, billableMinutes: 30,
+        projects: { [project]: 40 }, sharedWith: { [client.name === "acme" ? "globex" : "acme"]: 40 } }]);
+    }
+    const own = json.clients[2];
+    assert.equal(own.billable, false); assert.equal(own.attentionHours, 0.67);
+    assert.equal(own.billableHours, null); assert.equal(own.overlapHours, null);
+    assert.equal(own.byDay[0].overlapHours, null); assert.equal(own.byDay[0].billableHours, null);
+    assert.equal(own.byHour[0].capFactor, null); assert.equal(own.byHour[0].overlapMinutes, null); assert.equal(own.byHour[0].billableMinutes, null);
+    assert.equal(own.byHour[0].sharedWith, undefined);
+    assert.deepEqual(json.unassigned, [{ project: "/tmp/unassigned", attentionHours: 0.67 }]);
+    const filtered = execute(["--client", "acme", "--json"]);
+    assert.equal(filtered.status, 0, filtered.stderr);
+    assert.deepEqual(JSON.parse(filtered.stdout).clients, [json.clients[0]]);
+    const relayed = execute(["--json", "--relay-prefix", "Continue."]);
+    assert.equal(relayed.status, 0, relayed.stderr);
+    assert.ok(JSON.parse(relayed.stdout).clients.every((c) => c.attentionHours === 0 && c.byHour.length === 0));
+    const fixed = execute(["--json", "--timezone", "UTC", "--tz-offset", "2"]);
+    assert.equal(fixed.status, 1);
+    const source = execute(["--source", "codex", "--json"]);
+    assert.equal(source.status, 0, source.stderr); assert.ok(JSON.parse(source.stdout).clients.every((c) => c.attentionHours === 0));
+  });
+});
+
+test("clients human views and daily/hourly CSV in both languages", () => {
+  withClientLogs(({ execute, config, file }) => {
+    const human = execute([]);
+    assert.equal(human.status, 0, human.stderr);
+    assert.match(human.stdout, /2026-10-01.*zone UTC; cap 10min \/ prompt cap 10min \/ hourly cap 60min/);
+    assert.match(human.stdout, /acme \| 0\.67 \| 0\.17 \| 0\.50 \| 0\.67 \| 0\.00/);
+    assert.match(human.stdout, /own \(non-billable\) \| 0\.67 \| — \| —/);
+    assert.match(human.stdout, /Non-billable clients are excluded from the hourly cap/);
+    assert.match(human.stdout, /Unassigned: 1 projects, 0\.67 h attention \(use --json to list them\)/);
+    for (const [flags, pattern] of [
+      [["--by-day"], /2026-10-01 \| acme \| 0\.67 \| 0\.17 \| 0\.50/],
+      [["--by-hour"], /2026-10-01 10:00 \| acme \| 40\.000 \| 0\.750 \| 10\.000 \| 30\.000/],
+    ]) {
+      const result = execute(flags); assert.equal(result.status, 0, result.stderr); assert.match(result.stdout, pattern);
+    }
+    const headers = [
+      [[], "Date;Client;Attention (h);Overlap deduction (h);Billable (h)", "\u0044\u0061\u0074\u0075\u006d;\u004b\u0075\u006e\u0064\u0065;\u0041\u0075\u0066\u006d\u0065\u0072\u006b\u0073\u0061\u006d\u006b\u0065\u0069\u0074 (\u0068);\u004f\u0076\u0065\u0072\u006c\u0061\u0070-\u0041\u0062\u007a\u0075\u0067 (\u0068);\u0041\u0062\u0072\u0065\u0063\u0068\u0065\u006e\u0062\u0061\u0072 (\u0068)"],
+      [["--by-hour"], "Date;Hour;Client;Attention (min);Overlap deduction (min);Billable (min)", "\u0044\u0061\u0074\u0075\u006d;\u0053\u0074\u0075\u006e\u0064\u0065;\u004b\u0075\u006e\u0064\u0065;\u0041\u0075\u0066\u006d\u0065\u0072\u006b\u0073\u0061\u006d\u006b\u0065\u0069\u0074 (\u006d\u0069\u006e);\u004f\u0076\u0065\u0072\u006c\u0061\u0070-\u0041\u0062\u007a\u0075\u0067 (\u006d\u0069\u006e);\u0041\u0062\u0072\u0065\u0063\u0068\u0065\u006e\u0062\u0061\u0072 (\u006d\u0069\u006e)"],
+    ];
+    for (const [flags, en, de] of headers) {
+      for (const [lang, header] of [["en", en], ["de", de]]) {
+        const result = execute(["--csv", "--lang", lang, ...flags]);
+        assert.equal(result.status, 0, result.stderr);
+        const lines = result.stdout.trim().split("\n");
+        assert.equal(lines[0], header); assert.equal(lines.length, 4);
+        assert.ok(lines.includes(flags.length ? "2026-10-01;10:00;acme;40.000;10.000;30.000" : "2026-10-01;acme;0.67;0.17;0.50"));
+        assert.ok(lines.includes(flags.length ? "2026-10-01;10:00;own;40.000;;" : "2026-10-01;own;0.67;;"));
+      }
+    }
+    config.clients['acme;"shop"'] = config.clients.acme; delete config.clients.acme;
+    fs.writeFileSync(file, JSON.stringify(config));
+    assert.match(execute(["--csv"]).stdout, /;"acme;""shop""";0\.67;0\.17;0\.50/);
+  });
+});
+
+test("clients rejects unsupported options, missing configuration, and unknown names", () => {
+  withClientLogs(({ execute, fixtureRun, file }) => {
+    for (const flag of ["--project", "--all-projects", "--split", "--by-session", "--worklog", "--worklog-json", "--summarize", "--pauses"]) {
+      const result = execute([flag, ...(flag === "--project" ? ["/tmp/acme"] : [])]);
+      assert.equal(result.status, 1); assert.match(result.stderr, /not supported with clients/);
+    }
+    const unknown = execute(["--client", "missing"]);
+    assert.equal(unknown.status, 1); assert.match(unknown.stderr, /Configured clients: acme, globex, own/);
+    const extra = execute(["extra"]); assert.equal(extra.status, 1); assert.match(extra.stderr, /Usage:/);
+    for (const args of [["--by-hour"], ["doctor", "--by-hour"]]) {
+      const result = fixtureRun(args); assert.equal(result.status, 1); assert.match(result.stderr, /--by-hour requires the clients command/);
+    }
+    const empty = execute(["--relay-prefix", ""]); assert.equal(empty.status, 1); assert.match(empty.stderr, /--relay-prefix must be a non-empty string/);
+    const plainEmpty = fixtureRun(["--relay-prefix", ""]); assert.equal(plainEmpty.status, 1); assert.match(plainEmpty.stderr, /non-empty string/);
+    fs.writeFileSync(file, "{}");
+    const noClients = execute([]); assert.equal(noClients.status, 1); assert.match(noClients.stderr, /No clients configured.*README.*configuration/);
+    const missing = fixtureRun(["clients"]); assert.equal(missing.status, 1); assert.match(missing.stderr, /No clients configured/);
+  });
+});
+
+test("all-projects keeps the exact pre-clients fixture output", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "ah-all-projects-baseline-"));
+  try {
+    for (const [name, flags] of [["plain", []], ["split", ["--split"]], ["json", ["--json"]]]) {
+      const result = run(["--all-projects", "--source", "codex", "--timezone", "UTC", ...flags], { HOME: home });
+      assert.equal(result.status, 0, result.stderr);
+      assert.equal(result.stdout, fs.readFileSync(path.join(ROOT, "test/fixtures", `clients-all-projects-${name}.txt`), "utf8"));
+    }
+  } finally { fs.rmSync(home, { recursive: true, force: true }); }
+});

@@ -55,6 +55,10 @@ agent-hours doctor                         # source, retention, and schema diagn
 
 ## Notes
 
+- For billing a client across repositories, use \`agent-hours clients --client <name> --json\`
+  with configured client projects. The hourly cap includes all billable clients
+  even when output is filtered; non-billable clients are excluded.
+
 - When hours look wrong or after an agent update, run \`agent-hours doctor\`
   (or \`agent-hours doctor --json\`). It is read-only and reports counts and
   schema names, never prompts, log content, or project paths.

@@ -3,9 +3,15 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
 
+import { canonicalProjectPath } from "./sources/codex.js";
+
+export interface ClientProject { path: string; descendants: boolean }
+export interface ClientConfig { projects: ClientProject[]; billable: boolean }
+export type ClientsConfig = Record<string, ClientConfig>;
+
 export interface AgentHoursConfig {
   relayPrefixes: string[];
-  clients?: unknown;
+  clients: ClientsConfig;
 }
 
 export function defaultConfigPath(): string {
@@ -19,7 +25,7 @@ export function loadConfig(explicitPath?: string): AgentHoursConfig {
   try {
     text = fs.readFileSync(file, "utf8");
   } catch (error) {
-    if (explicitPath === undefined && (error as NodeJS.ErrnoException).code === "ENOENT") return { relayPrefixes: [] };
+    if (explicitPath === undefined && (error as NodeJS.ErrnoException).code === "ENOENT") return { relayPrefixes: [], clients: {} };
     throw problem(`cannot read file (${(error as NodeJS.ErrnoException).code ?? "unknown error"})`);
   }
   let value: unknown;
@@ -34,5 +40,44 @@ export function loadConfig(explicitPath?: string): AgentHoursConfig {
   if (!Array.isArray(prefixes) || prefixes.some((prefix) => typeof prefix !== "string" || prefix.length === 0)) {
     throw problem("relayPrefixes must be an array of non-empty strings");
   }
-  return { relayPrefixes: prefixes, ...("clients" in config ? { clients: config["clients"] } : {}) };
+  const object = (value: unknown): value is Record<string, unknown> =>
+    !!value && typeof value === "object" && !Array.isArray(value);
+  const rawClients = "clients" in config ? config["clients"] : {};
+  if (!object(rawClients)) throw problem("clients must be an object");
+  const clients: ClientsConfig = {};
+  const owners = new Map<string, string>();
+  for (const [name, value] of Object.entries(rawClients)) {
+    if (!name.trim()) throw problem("client names must be non-empty");
+    if (!object(value)) throw problem("each client must be an object");
+    for (const key of Object.keys(value)) {
+      if (key !== "projects" && key !== "billable") throw problem("unknown client key");
+    }
+    if ("billable" in value && typeof value["billable"] !== "boolean") throw problem("billable must be a boolean");
+    const projects = value["projects"];
+    if (!Array.isArray(projects) || !projects.length) throw problem("projects must be a non-empty array");
+    Object.defineProperty(clients, name, { enumerable: true, value: {
+      billable: value["billable"] !== false,
+      projects: projects.map((entry): ClientProject => {
+        if (typeof entry !== "string" && !object(entry)) throw problem("project must be a path string or object");
+        if (object(entry)) {
+          for (const key of Object.keys(entry)) {
+            if (key !== "path" && key !== "descendants") throw problem("unknown project key");
+          }
+          if ("descendants" in entry && typeof entry["descendants"] !== "boolean") throw problem("descendants must be a boolean");
+        }
+        const rawPath = typeof entry === "string" ? entry : entry["path"];
+        if (typeof rawPath !== "string" || !rawPath.length) throw problem("project path must be a non-empty string");
+        let projectPath: string = rawPath;
+        if (projectPath === "~") projectPath = os.homedir();
+        else if (projectPath.startsWith("~/")) projectPath = path.join(os.homedir(), projectPath.slice(2));
+        if (!path.isAbsolute(projectPath)) throw problem("project path must be absolute after home expansion");
+        projectPath = canonicalProjectPath(projectPath);
+        const owner = owners.get(projectPath);
+        if (owner !== undefined) throw problem(`duplicate project path in clients ${JSON.stringify(owner)} and ${JSON.stringify(name)}`);
+        owners.set(projectPath, name);
+        return { path: projectPath, descendants: typeof entry === "string" || entry["descendants"] !== false };
+      }),
+    } });
+  }
+  return { relayPrefixes: prefixes, clients };
 }

@@ -1,0 +1,27 @@
+{
+  "capMinutes": 10,
+  "promptCapMinutes": 10,
+  "source": "codex",
+  "relayPrefixes": [],
+  "timeZone": "UTC",
+  "tzOffsetHours": null,
+  "totalHours": 0.28,
+  "projects": [
+    {
+      "project": "/tmp/proj-current",
+      "totalHours": 0.23,
+      "attentionHours": 0,
+      "aiAutonomousHours": 0.23,
+      "events": 11,
+      "lastActivity": "2026-06-02"
+    },
+    {
+      "project": "/tmp/proj-current/sub",
+      "totalHours": 0.02,
+      "attentionHours": 0,
+      "aiAutonomousHours": 0.02,
+      "events": 3,
+      "lastActivity": "2026-06-02"
+    }
+  ]
+}

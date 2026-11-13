@@ -311,3 +311,25 @@ test("doctor reports default config status and survives invalid config without p
     assert.doesNotMatch(result.stdout, /Private prompt content/);
   });
 });
+
+test("doctor reports only client counts and removes names from duplicate-path errors", () => {
+  fixture(({ configHome, run }) => {
+    const file = path.join(configHome, "agent-hours", "config.json");
+    fs.mkdirSync(path.dirname(file));
+    const clients = { acme: { projects: ["/tmp/client-a"] }, globex: { projects: ["/tmp/client-b"] } };
+    fs.writeFileSync(file, JSON.stringify({ clients }));
+    const result = run(["--json"]);
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(JSON.parse(result.stdout).config.clients, 2);
+    assert.match(run().stdout, /0 relay prefixes; 2 clients/);
+    assert.doesNotMatch(result.stdout, /acme|globex|\/tmp\/client-/);
+    clients.globex.projects = clients.acme.projects;
+    fs.writeFileSync(file, JSON.stringify({ clients }));
+    for (const args of [[], ["--json"]]) {
+      const broken = run(args);
+      assert.equal(broken.status, 0, broken.stderr);
+      assert.match(broken.stdout, /duplicate project path in clients/);
+      assert.doesNotMatch(broken.stdout, /acme|globex|\/tmp\/client-/);
+    }
+  });
+});

@@ -7,6 +7,7 @@
  * Data source: local Claude and Codex JSONL transcripts (retroactive, zero
  * setup — nothing leaves your machine unless --summarize is requested).
  */
+import { computeClients, HOURLY_CAP_MINUTES, type ClientResult } from "./clients.js";
 import { loadConfig } from "./config.js";
 import { collectDoctor, formatDoctor } from "./doctor.js";
 import { parseArgs } from "node:util";
@@ -71,6 +72,7 @@ Usage:
                                      drops a skill so you can just ask
                                      "what did I work on this week?", and
                                      offers to raise Claude's log retention
+  npx agent-hours clients            attention and capped billing across repositories
   npx agent-hours doctor             inspect sources, retention, and schema (or --json)
   npx agent-hours                    current project, cap overview
   npx agent-hours --split            direct interaction / supervised / AI-autonomous
@@ -84,7 +86,7 @@ Usage:
 
 Options:
   --project <path|hash>  project to analyze (default: cwd)
-  --config <file>       read configuration from this file
+  --config <file>        read configuration from this file
   --relay-prefix <text>  exclude relayed prompts with this prefix (repeatable)
   --source <s>           auto | claude | codex (default: auto — merges all
                          agents into ONE timeline, no double counting)
@@ -96,6 +98,8 @@ Options:
   --cap <min>            idle cap for total time (default: 10)
   --prompt-cap <min>     cap for direct-interaction windows (default: 10)
   --split                show the three-state human/AI split
+  --client <name>        print one configured client (clients command)
+  --by-hour              per-hour client breakdown (clients command)
   --by-day               per-day breakdown
   --by-session           per-session breakdown (parallel-session debugging)
   --worklog              hourly what-was-done log (markdown)
@@ -129,6 +133,8 @@ const CSV_HEADERS = {
     split: ["Direct interaction (h)", "Supervised (h)", "Human attention (h)", "AI autonomous (h)"],
     worklogDay: ["Date", "Active (h)", "Direct interaction (h)", "Supervised (h)", "AI (h)", "Description"],
     worklogHour: ["Date", "Hour", "Active (min)", "Direct interaction (min)", "Supervised (min)", "AI (min)", "Description"],
+    clientsDay: ["Date", "Client", "Attention (h)", "Overlap deduction (h)", "Billable (h)"],
+    clientsHour: ["Date", "Hour", "Client", "Attention (min)", "Overlap deduction (min)", "Billable (min)"],
     total: "TOTAL",
   },
   de: {
@@ -136,6 +142,8 @@ const CSV_HEADERS = {
     split: ["Direct interaction (h)", "Supervised (h)", "Mensch gesamt (h)", "AI-solo (h)"],
     worklogDay: ["Datum", "Aktiv (h)", "Direct interaction (h)", "Supervised (h)", "AI (h)", "Beschreibung"],
     worklogHour: ["Datum", "Stunde", "Aktiv (min)", "Direct interaction (min)", "Supervised (min)", "AI (min)", "Beschreibung"],
+    clientsDay: ["Datum", "Kunde", "Aufmerksamkeit (h)", "Overlap-Abzug (h)", "Abrechenbar (h)"],
+    clientsHour: ["Datum", "Stunde", "Kunde", "Aufmerksamkeit (min)", "Overlap-Abzug (min)", "Abrechenbar (min)"],
     total: "GESAMT",
   },
 };
@@ -228,6 +236,8 @@ async function main(): Promise<void> {
         config: { type: "string" },
         "relay-prefix": { type: "string", multiple: true },
         project: { type: "string" },
+        client: { type: "string" },
+        "by-hour": { type: "boolean", default: false },
         source: { type: "string", default: "auto" },
         summarize: { type: "boolean", default: false },
         since: { type: "string" },
@@ -262,6 +272,16 @@ async function main(): Promise<void> {
   if (args.lang !== "en" && args.lang !== "de") fail("--lang must be en or de.");
   const lang: CsvLanguage = args.lang;
 
+  const clientsCommand = positionals[0] === "clients";
+  if (clientsCommand && positionals.length > 1) fail("Usage: agent-hours clients [options]");
+  if (args["by-hour"] && !clientsCommand) fail("--by-hour requires the clients command.");
+  if (args.client !== undefined && !clientsCommand) fail("--client requires the clients command.");
+  if (clientsCommand) {
+    for (const flag of ["project", "all-projects", "split", "by-session", "worklog", "worklog-json", "summarize", "pauses"] as const) {
+      if (args[flag] !== undefined && args[flag] !== false) fail(`--${flag} is not supported with clients.`);
+    }
+  }
+
   if (positionals[0] === "doctor") {
     if (positionals.length > 1) fail("Usage: agent-hours doctor [--json]");
     doctorCommand = true;
@@ -291,7 +311,7 @@ async function main(): Promise<void> {
     console.log("and/or \"Bash(npx agent-hours *)\" in ~/.claude/settings.json");
     console.log("under permissions.allow.");
     return;
-  } else if (positionals.length > 0) {
+  } else if (positionals.length > 0 && !clientsCommand) {
     fail(`Unknown command '${positionals[0]}'. Run agent-hours --help for usage.`);
   }
 
@@ -307,7 +327,16 @@ async function main(): Promise<void> {
     return;
   }
 
-  const relayPrefixes = [...new Set([...loadConfig(args.config).relayPrefixes, ...(args["relay-prefix"] ?? [])])];
+  if (args["relay-prefix"]?.some((prefix) => prefix.length === 0)) fail("--relay-prefix must be a non-empty string.");
+  const config = loadConfig(args.config);
+  const relayPrefixes = [...new Set([...config.relayPrefixes, ...(args["relay-prefix"] ?? [])])];
+  if (clientsCommand) {
+    const names = Object.keys(config.clients);
+    if (!names.length) fail("No clients configured. See README Configuration: https://github.com/pmochine/agent-hours#configuration");
+    if (args.client !== undefined && !Object.hasOwn(config.clients, args.client)) {
+      fail(`Unknown client ${JSON.stringify(args.client)}. Configured clients: ${names.join(", ")}`);
+    }
+  }
 
   const cap = Number(args.cap);
   const promptCap = Number(args["prompt-cap"]);
@@ -362,6 +391,32 @@ async function main(): Promise<void> {
   }
   const wantClaude = source === "auto" || source === "claude";
   const wantCodex = source === "auto" || source === "codex";
+
+  if (clientsCommand) {
+    const projects = loadAllProjectSessions(loadOptions, source);
+    const report = computeClients(config.clients, [...projects.values()], {
+      capMinutes: cap, promptCapMinutes: promptCap, timeZone, ...range,
+      openStart: (loadOptions.stats?.prunedFiles ?? 0) > 0,
+    });
+    const clients = report.clients.filter((client) => args.client === undefined || client.name === args.client);
+    if (args.json) {
+      console.log(JSON.stringify({
+        since: args.since ?? null, until: args.until ?? null,
+        capMinutes: cap, promptCapMinutes: promptCap, hourlyCapMinutes: HOURLY_CAP_MINUTES,
+        timeZone: typeof timeZone === "string" ? timeZone : null,
+        tzOffsetHours: typeof timeZone === "number" ? timeZone : null,
+        source, relayPrefixes, clients: clients.map(clientJson),
+        unassigned: report.unassigned.map((project) => ({ project: project.project, attentionHours: roundedHours(project.attentionMinutes) })),
+      }, null, 2));
+    } else {
+      printClients(clients, args.csv, args["by-day"], args["by-hour"], lang,
+        `${args.since ?? "all history"} – ${args.until ?? "now"}; zone ${timeZone}; cap ${cap}min / prompt cap ${promptCap}min / hourly cap ${HOURLY_CAP_MINUTES}min`);
+      if (!args.csv && report.unassigned.length) {
+        console.log(`Unassigned: ${report.unassigned.length} projects, ${fmtH(report.unassigned.reduce((sum, project) => sum + project.attentionMinutes, 0))} h attention (use --json to list them).`);
+      }
+    }
+    return;
+  }
 
   if (args["all-projects"]) {
     runAllProjects(sinceMs, untilMs, loadOptions, cap, promptCap, timeZone, source, args.split, args.json);
@@ -936,30 +991,60 @@ function printJson(
   );
 }
 
-function runAllProjects(
-  sinceMs: number,
-  untilMs: number,
-  loadOptions: TimelineLoadOptions,
-  cap: number,
-  promptCap: number,
-  timeZone: TimeZoneSpec,
-  source: string,
-  withSplit: boolean,
-  asJson: boolean
-): void {
-  interface Row {
-    project: string;
-    totalHours: number;
-    attentionHours: number;
-    aiAutonomousHours: number;
-    events: number;
-    lastActivity: string;
-  }
-  interface ProjectSessions {
-    project: string;
-    sessions: NamedSession[];
-  }
+function roundedHours(minutes: number | null): number | null {
+  return minutes === null ? null : +(minutes / 60).toFixed(2);
+}
+function roundedMinutes(minutes: number | null): number | null {
+  return minutes === null ? null : +minutes.toFixed(3);
+}
+function clientJson(client: ClientResult) {
+  return {
+    name: client.name, billable: client.billable,
+    totalHours: roundedHours(client.totalMinutes), aiAutonomousHours: roundedHours(client.aiAutonomousMinutes),
+    attentionHours: roundedHours(client.attentionMinutes), overlapHours: roundedHours(client.overlapMinutes), billableHours: roundedHours(client.billableMinutes),
+    projects: client.projects.map((project) => ({ project: project.project, attentionHours: roundedHours(project.attentionMinutes) })),
+    byDay: client.byDay.map((day) => ({ date: day.date, attentionHours: roundedHours(day.attentionMinutes), overlapHours: roundedHours(day.overlapMinutes), billableHours: roundedHours(day.billableMinutes) })),
+    byHour: client.byHour.map((hour) => ({
+      ...hour, attentionMinutes: roundedMinutes(hour.attentionMinutes), overlapMinutes: roundedMinutes(hour.overlapMinutes), billableMinutes: roundedMinutes(hour.billableMinutes),
+      projects: Object.fromEntries(Object.entries(hour.projects).map(([project, minutes]) => [project, roundedMinutes(minutes)])),
+      ...(hour.sharedWith ? { sharedWith: Object.fromEntries(Object.entries(hour.sharedWith).map(([name, minutes]) => [name, roundedMinutes(minutes)])) } : {}),
+    })),
+  };
+}
 
+function printClients(clients: ClientResult[], csv: boolean, byDay: boolean, byHour: boolean, lang: CsvLanguage, header: string): void {
+  const value = (minutes: number | null, hourly: boolean) => minutes === null ? (csv ? "" : "—") : hourly ? minutes.toFixed(3) : fmtH(minutes);
+  if (csv) console.log(CSV_HEADERS[lang][byHour ? "clientsHour" : "clientsDay"].join(";"));
+  else {
+    console.log(`Client attention — ${header}`);
+    console.log(byHour ? "Hour | Client | Attention (min) | Cap factor | Overlap deduction (min) | Billable (min)"
+      : byDay ? "Date | Client | Attention (h) | Overlap deduction (h) | Billable (h)"
+      : "Client | Attention (h) | Overlap deduction (h) | Billable (h) | Total activity (h) | AI-autonomous (h)");
+  }
+  const separator = csv ? ";" : " | ";
+  for (const client of clients) {
+    const name = csv ? csvField(client.name) : client.name + (client.billable ? "" : " (non-billable)");
+    if (byHour) {
+      for (const hour of client.byHour) {
+        const prefix = csv ? [hour.hour.slice(0, 10), hour.hour.slice(11), name] : [hour.hour, name];
+        console.log([...prefix, value(hour.attentionMinutes, true), ...(!csv ? [hour.capFactor === null ? "—" : hour.capFactor.toFixed(3)] : []), value(hour.overlapMinutes, true), value(hour.billableMinutes, true)].join(separator));
+      }
+    } else if (byDay || csv) {
+      for (const day of client.byDay) console.log([day.date, name, value(day.attentionMinutes, false), value(day.overlapMinutes, false), value(day.billableMinutes, false)].join(separator));
+    } else {
+      console.log([name, value(client.attentionMinutes, false), value(client.overlapMinutes, false), value(client.billableMinutes, false), fmtH(client.totalMinutes), fmtH(client.aiAutonomousMinutes)].join(separator));
+    }
+  }
+  if (!csv && clients.some((client) => !client.billable)) console.log("Non-billable clients are excluded from the hourly cap; overlap deduction and billable time do not apply.");
+}
+
+interface ProjectSessions {
+  project: string;
+  sessions: NamedSession[];
+}
+
+/** Group every source once, preserving hash-only Claude groups for all-projects. */
+function loadAllProjectSessions(loadOptions: TimelineLoadOptions, source: string): Map<string, ProjectSessions> {
   const projects = new Map<string, ProjectSessions>();
   const wantClaude = source === "auto" || source === "claude";
   const wantCodex = source === "auto" || source === "codex";
@@ -998,6 +1083,30 @@ function runAllProjects(
       projects.set(key, existing);
     }
   }
+
+  return projects;
+}
+
+function runAllProjects(
+  sinceMs: number,
+  untilMs: number,
+  loadOptions: TimelineLoadOptions,
+  cap: number,
+  promptCap: number,
+  timeZone: TimeZoneSpec,
+  source: string,
+  withSplit: boolean,
+  asJson: boolean
+): void {
+  interface Row {
+    project: string;
+    totalHours: number;
+    attentionHours: number;
+    aiAutonomousHours: number;
+    events: number;
+    lastActivity: string;
+  }
+  const projects = loadAllProjectSessions(loadOptions, source);
 
   const openStart = (loadOptions.stats?.prunedFiles ?? 0) > 0;
   const rows: Row[] = [];

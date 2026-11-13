@@ -6,6 +6,8 @@ All notable changes are documented here, following [Keep a Changelog](https://ke
 
 ### Added
 
+- `agent-hours clients` groups repositories by configured client, unions attention per client, and proportionally caps billable clients together at 60 minutes per clock hour. Includes project shares, unassigned repositories, client filtering, daily/hourly text and CSV views, JSON evidence, and configured client counts in doctor.
+
 - Configurable relay prefixes via a local JSON config, `--config`, and repeatable `--relay-prefix`; matching Claude and Codex prompts count as machine work across timing views while remaining worklog evidence.
 - Relay prefix metadata and relayed prompt counts in timing JSON, a human-readable count, and default config diagnostics in doctor.
 
