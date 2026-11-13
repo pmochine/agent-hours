@@ -47,33 +47,35 @@ export function loadConfig(explicitPath?: string): AgentHoursConfig {
   const clients: ClientsConfig = {};
   const owners = new Map<string, string>();
   for (const [name, value] of Object.entries(rawClients)) {
-    if (!name.trim()) throw problem("client names must be non-empty");
-    if (!object(value)) throw problem("each client must be an object");
+    const clientProblem = (message: string): Error => problem(`client ${JSON.stringify(name)}: ${message}`);
+    if (!name.trim()) throw clientProblem("client names must be non-empty");
+    if (!object(value)) throw clientProblem("each client must be an object");
     for (const key of Object.keys(value)) {
-      if (key !== "projects" && key !== "billable") throw problem("unknown client key");
+      if (key !== "projects" && key !== "billable") throw clientProblem(`unknown key ${JSON.stringify(key)}`);
     }
-    if ("billable" in value && typeof value["billable"] !== "boolean") throw problem("billable must be a boolean");
+    if ("billable" in value && typeof value["billable"] !== "boolean") throw clientProblem("billable must be a boolean");
     const projects = value["projects"];
-    if (!Array.isArray(projects) || !projects.length) throw problem("projects must be a non-empty array");
+    if (!Array.isArray(projects) || !projects.length) throw clientProblem("projects must be a non-empty array");
     Object.defineProperty(clients, name, { enumerable: true, value: {
       billable: value["billable"] !== false,
-      projects: projects.map((entry): ClientProject => {
-        if (typeof entry !== "string" && !object(entry)) throw problem("project must be a path string or object");
+      projects: projects.map((entry, index): ClientProject => {
+        const projectProblem = (message: string): Error => clientProblem(`project ${index + 1}: ${message}`);
+        if (typeof entry !== "string" && !object(entry)) throw projectProblem("project must be a path string or object");
         if (object(entry)) {
           for (const key of Object.keys(entry)) {
-            if (key !== "path" && key !== "descendants") throw problem("unknown project key");
+            if (key !== "path" && key !== "descendants") throw projectProblem(`unknown key ${JSON.stringify(key)}`);
           }
-          if ("descendants" in entry && typeof entry["descendants"] !== "boolean") throw problem("descendants must be a boolean");
+          if ("descendants" in entry && typeof entry["descendants"] !== "boolean") throw projectProblem("descendants must be a boolean");
         }
         const rawPath = typeof entry === "string" ? entry : entry["path"];
-        if (typeof rawPath !== "string" || !rawPath.length) throw problem("project path must be a non-empty string");
+        if (typeof rawPath !== "string" || !rawPath.length) throw projectProblem("path must be a non-empty string");
         let projectPath: string = rawPath;
         if (projectPath === "~") projectPath = os.homedir();
         else if (projectPath.startsWith("~/")) projectPath = path.join(os.homedir(), projectPath.slice(2));
-        if (!path.isAbsolute(projectPath)) throw problem("project path must be absolute after home expansion");
+        if (!path.isAbsolute(projectPath)) throw projectProblem("path must be absolute after home expansion");
         projectPath = canonicalProjectPath(projectPath);
         const owner = owners.get(projectPath);
-        if (owner !== undefined) throw problem(`duplicate project path in clients ${JSON.stringify(owner)} and ${JSON.stringify(name)}`);
+        if (owner !== undefined) throw projectProblem(`duplicate project path in clients ${JSON.stringify(owner)} and ${JSON.stringify(name)}`);
         owners.set(projectPath, name);
         return { path: projectPath, descendants: typeof entry === "string" || entry["descendants"] !== false };
       }),

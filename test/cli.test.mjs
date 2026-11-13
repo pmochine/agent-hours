@@ -660,13 +660,13 @@ test("clients human views and daily/hourly CSV in both languages", () => {
     const human = execute([]);
     assert.equal(human.status, 0, human.stderr);
     assert.match(human.stdout, /2026-10-01.*zone UTC; cap 10min \/ prompt cap 10min \/ hourly cap 60min/);
-    assert.match(human.stdout, /acme \| 0\.67 \| 0\.17 \| 0\.50 \| 0\.67 \| 0\.00/);
-    assert.match(human.stdout, /own \(non-billable\) \| 0\.67 \| — \| —/);
+    assert.match(human.stdout, /acme +\| +0\.67 \| +0\.17 \| +0\.50 \| +0\.67 \| +0\.00/);
+    assert.match(human.stdout, /own \(non-billable\) +\| +0\.67 \| +— \| +—/);
     assert.match(human.stdout, /Non-billable clients are excluded from the hourly cap/);
     assert.match(human.stdout, /Unassigned: 1 projects, 0\.67 h attention \(use --json to list them\)/);
     for (const [flags, pattern] of [
-      [["--by-day"], /2026-10-01 \| acme \| 0\.67 \| 0\.17 \| 0\.50/],
-      [["--by-hour"], /2026-10-01 10:00 \| acme \| 40\.000 \| 0\.750 \| 10\.000 \| 30\.000/],
+      [["--by-day"], /2026-10-01 \| acme +\| +0\.67 \| +0\.17 \| +0\.50/],
+      [["--by-hour"], /2026-10-01 10:00 \| acme +\| +40\.000 \| +0\.750 \| +10\.000 \| +30\.000/],
     ]) {
       const result = execute(flags); assert.equal(result.status, 0, result.stderr); assert.match(result.stdout, pattern);
     }
@@ -719,4 +719,31 @@ test("all-projects keeps the exact pre-clients fixture output", () => {
       assert.equal(result.stdout, fs.readFileSync(path.join(ROOT, "test/fixtures", `clients-all-projects-${name}.txt`), "utf8"));
     }
   } finally { fs.rmSync(home, { recursive: true, force: true }); }
+});
+
+
+test("clients text columns align and JSON includes configured projects without sessions", () => {
+  withClientLogs(({ execute, config, file }) => {
+    config.clients.acme.projects.push("/tmp/acme/missing");
+    config.clients.empty = { projects: ["/tmp/empty-project"] };
+    fs.writeFileSync(file, JSON.stringify(config));
+    const result = execute(["--json"]);
+    assert.equal(result.status, 0, result.stderr);
+    const clients = JSON.parse(result.stdout).clients;
+    assert.deepEqual(clients[0].projects, [{ project: "/tmp/acme/shop", attentionHours: 0.67 }, { project: "/tmp/acme/missing", attentionHours: 0 }]);
+    assert.deepEqual(clients.find((client) => client.name === "empty").projects, [{ project: "/tmp/empty-project", attentionHours: 0 }]);
+    for (const flags of [[], ["--by-day"], ["--by-hour"]]) {
+      const text = execute(flags);
+      assert.equal(text.status, 0, text.stderr);
+      const rows = text.stdout.split("\n").filter((line) => line.includes(" | "));
+      const positions = (line) => [...line.matchAll(/ \| /g)].map((match) => match.index);
+      for (const row of rows) assert.deepEqual(positions(row), positions(rows[0]));
+      const nameColumn = flags.length ? 1 : 0;
+      for (const row of rows.slice(1)) {
+        const cells = row.split(" | ");
+        assert.equal(cells[nameColumn], cells[nameColumn].trimStart());
+        for (const cell of cells.slice(nameColumn + 1)) assert.equal(cell, cell.trimEnd());
+      }
+    }
+  });
 });

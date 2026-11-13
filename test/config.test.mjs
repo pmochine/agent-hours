@@ -48,11 +48,11 @@ test("config validates client definitions and canonicalizes paths", () => {
       [{ "": { projects: ["/tmp/acme"] } }, /names must be non-empty/],
       [{ " ": { projects: ["/tmp/acme"] } }, /names must be non-empty/],
       ...[null, true, [], "acme"].map((value) => [badClient(value), /each client must be an object/]),
-      [badClient({ projects: ["/tmp/acme"], extra: true }), /unknown client key/],
+      [badClient({ projects: ["/tmp/acme"], extra: true }), /client "acme": unknown key "extra"/],
       ...[null, 1, "false"].map((billable) => [badClient({ projects: ["/tmp/acme"], billable }), /billable must be a boolean/]),
       ...[undefined, null, [], "path", {}].map((projects) => [badClient({ projects }), /projects must be a non-empty array/]),
       ...[null, false, 1, []].map((entry) => [badClient({ projects: [entry] }), /project must be a path string or object/]),
-      [badClient({ projects: [{ path: "/tmp/acme", extra: true }] }), /unknown project key/],
+      [badClient({ projects: [{ path: "/tmp/acme", extra: true }] }), /client "acme": project 1: unknown key "extra"/],
       ...[null, 1, "true"].map((descendants) => [badClient({ projects: [{ path: "/tmp/acme", descendants }] }), /descendants must be a boolean/]),
       ...[{}, { path: null }, { path: 1 }, { path: "" }, ""].map((entry) => [badClient({ projects: [entry] }), /path must be a non-empty string/]),
       ...["relative", "~someone/code"].map((entry) => [badClient({ projects: [entry] }), /path must be absolute/]),
@@ -62,6 +62,10 @@ test("config validates client definitions and canonicalizes paths", () => {
       write(clients);
       assert.throws(() => loadConfig(file), message);
     }
+    write({ acme: { projets: ["/tmp/acme"] } });
+    assert.throws(() => loadConfig(file), /client "acme": unknown key "projets"/);
+    write({ acme: { projects: ["/tmp/acme", "relative"] } });
+    assert.throws(() => loadConfig(file), /client "acme": project 2: path must be absolute after home expansion/);
     const unicode = path.join(fs.realpathSync(dir), "caf\u00e9");
     fs.mkdirSync(unicode);
     const alias = path.join(dir, "alias");

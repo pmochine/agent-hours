@@ -96,6 +96,14 @@ export function computeClients(
       });
       byHour.push({ hour, attentionMinutes: attention, capFactor: null, overlapMinutes: null, billableMinutes: null, projects: hourProjects });
     }
+    for (const entry of config.projects) {
+      const prefix = entry.path.endsWith(path.sep) ? entry.path : entry.path + path.sep;
+      const hasSessions = projects.some((project) => project.sessions.length > 0 &&
+        (project.project === entry.path || (entry.descendants && project.project.startsWith(prefix))));
+      if (!hasSessions && !shares.some((share) => share.project === entry.path)) {
+        shares.push({ project: entry.path, attentionMinutes: 0 });
+      }
+    }
     return {
       name, billable: config.billable, totalMinutes: split.totalMinutes, aiAutonomousMinutes: split.aiAutonomousMinutes,
       attentionMinutes: byHour.reduce((sum, hour) => sum + hour.attentionMinutes, 0),

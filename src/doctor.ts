@@ -53,7 +53,7 @@ export function collectDoctor(now = Date.now()) {
   const configPath = defaultConfigPath();
   const config = { path: displayPath(configPath), exists: fs.existsSync(configPath), relayPrefixes: [] as string[], clients: 0, error: null as string | null };
   try { const loaded = loadConfig(); config.relayPrefixes = loaded.relayPrefixes; config.clients = Object.keys(loaded.clients).length; }
-  catch (error) { config.error = (error as Error).message.replaceAll(os.homedir(), "~").replace(/duplicate project path in clients .*/, "duplicate project path in clients"); }
+  catch (error) { config.error = (error as Error).message.replaceAll(os.homedir(), "~").replace(/client "(?:\\.|[^"\\])*": /g, "client: ").replace(/duplicate project path in clients .*/, "duplicate project path in clients"); }
   const files: LogFile[] = [];
   const unsupported = new Map<string, number>();
   let nestedSubagentDirectories = 0;

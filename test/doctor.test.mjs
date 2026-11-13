@@ -333,3 +333,25 @@ test("doctor reports only client counts and removes names from duplicate-path er
     }
   });
 });
+
+
+test("doctor strips client names from every contextual validation error", () => {
+  fixture(({ configHome, run }) => {
+    const file = path.join(configHome, "agent-hours", "config.json");
+    fs.mkdirSync(path.dirname(file));
+    for (const name of ["private-client", 'private-"client', "private-\nclient"]) {
+      for (const value of [null, { projets: [] }, { billable: "yes" }, { projects: [] },
+        { projects: [null] }, { projects: [{ path: "/tmp/private-project", extra: true }] },
+        { projects: [{ path: "/tmp/private-project", descendants: "yes" }] },
+        { projects: ["/tmp/private-project", "private-relative-path"] }]) {
+        fs.writeFileSync(file, JSON.stringify({ clients: { [name]: value } }));
+        for (const args of [[], ["--json"]]) {
+          const result = run(args);
+          assert.equal(result.status, 0, result.stderr);
+          assert.doesNotMatch(result.stdout, /private-|private-project|private-relative-path/);
+          assert.match(result.stdout, /client:/);
+        }
+      }
+    }
+  });
+});

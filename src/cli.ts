@@ -1014,26 +1014,32 @@ function clientJson(client: ClientResult) {
 
 function printClients(clients: ClientResult[], csv: boolean, byDay: boolean, byHour: boolean, lang: CsvLanguage, header: string): void {
   const value = (minutes: number | null, hourly: boolean) => minutes === null ? (csv ? "" : "—") : hourly ? minutes.toFixed(3) : fmtH(minutes);
+  const rows: string[][] = [];
+  const printRow = (row: string[]) => { if (csv) console.log(row.join(";")); else rows.push(row); };
   if (csv) console.log(CSV_HEADERS[lang][byHour ? "clientsHour" : "clientsDay"].join(";"));
   else {
     console.log(`Client attention — ${header}`);
-    console.log(byHour ? "Hour | Client | Attention (min) | Cap factor | Overlap deduction (min) | Billable (min)"
+    rows.push((byHour ? "Hour | Client | Attention (min) | Cap factor | Overlap deduction (min) | Billable (min)"
       : byDay ? "Date | Client | Attention (h) | Overlap deduction (h) | Billable (h)"
-      : "Client | Attention (h) | Overlap deduction (h) | Billable (h) | Total activity (h) | AI-autonomous (h)");
+      : "Client | Attention (h) | Overlap deduction (h) | Billable (h) | Total activity (h) | AI-autonomous (h)").split(" | "));
   }
-  const separator = csv ? ";" : " | ";
   for (const client of clients) {
     const name = csv ? csvField(client.name) : client.name + (client.billable ? "" : " (non-billable)");
     if (byHour) {
       for (const hour of client.byHour) {
         const prefix = csv ? [hour.hour.slice(0, 10), hour.hour.slice(11), name] : [hour.hour, name];
-        console.log([...prefix, value(hour.attentionMinutes, true), ...(!csv ? [hour.capFactor === null ? "—" : hour.capFactor.toFixed(3)] : []), value(hour.overlapMinutes, true), value(hour.billableMinutes, true)].join(separator));
+        printRow([...prefix, value(hour.attentionMinutes, true), ...(!csv ? [hour.capFactor === null ? "—" : hour.capFactor.toFixed(3)] : []), value(hour.overlapMinutes, true), value(hour.billableMinutes, true)]);
       }
     } else if (byDay || csv) {
-      for (const day of client.byDay) console.log([day.date, name, value(day.attentionMinutes, false), value(day.overlapMinutes, false), value(day.billableMinutes, false)].join(separator));
+      for (const day of client.byDay) printRow([day.date, name, value(day.attentionMinutes, false), value(day.overlapMinutes, false), value(day.billableMinutes, false)]);
     } else {
-      console.log([name, value(client.attentionMinutes, false), value(client.overlapMinutes, false), value(client.billableMinutes, false), fmtH(client.totalMinutes), fmtH(client.aiAutonomousMinutes)].join(separator));
+      printRow([name, value(client.attentionMinutes, false), value(client.overlapMinutes, false), value(client.billableMinutes, false), fmtH(client.totalMinutes), fmtH(client.aiAutonomousMinutes)]);
     }
+  }
+  if (!csv) {
+    const textColumns = byHour || byDay ? 2 : 1;
+    const widths = rows[0].map((_, i) => Math.max(...rows.map((row) => row[i].length)));
+    for (const row of rows) console.log(row.map((cell, i) => i < textColumns ? cell.padEnd(widths[i]) : cell.padStart(widths[i])).join(" | "));
   }
   if (!csv && clients.some((client) => !client.billable)) console.log("Non-billable clients are excluded from the hourly cap; overlap deduction and billable time do not apply.");
 }

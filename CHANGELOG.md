@@ -6,6 +6,8 @@ All notable changes are documented here, following [Keep a Changelog](https://ke
 
 ### Changed
 
+- Identify clients and fields in configuration errors while keeping doctor anonymous, align client text tables, and include configured projects without sessions as zero-attention JSON entries.
+
 - Place direct-interaction tails at the end of each gap before the prompt or intervening event; hourly, daily, and range distributions shift while all-time sums remain unchanged.
 
 ### Added
