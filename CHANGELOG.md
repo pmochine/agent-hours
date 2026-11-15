@@ -2,7 +2,7 @@
 
 All notable changes are documented here, following [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [0.7.0] - 2026-11-15
 
 ### Fixed
 
@@ -11,13 +11,11 @@ All notable changes are documented here, following [Keep a Changelog](https://ke
 ### Changed
 
 - Identify clients and fields in report configuration errors, align client text tables, and include configured projects without sessions assigned to that client as zero-attention JSON entries. Doctor reports only config path, existence, validity, and counts, with a generic warning for invalid configs.
-
 - Place direct-interaction tails at the end of each gap before the prompt or intervening event; hourly, daily, and range distributions shift while all-time sums remain unchanged. Range boundaries can make split-derived daily, CSV, JSON total, and Sum values differ from the idle-cap overview.
 
 ### Added
 
 - `agent-hours clients` groups repositories by configured client, unions attention per client, and proportionally caps billable clients together at 60 minutes per clock hour. Includes project shares, unassigned repositories, client filtering, daily/hourly text and CSV views, JSON evidence, and configured client counts in doctor. Filtered output omits unassigned projects and anonymizes shared-hour peers as summed `others` minutes. Daily JSON includes three-decimal minute values alongside hours.
-
 - Configurable relay prefixes via a local JSON config, `--config`, and repeatable `--relay-prefix` (leading whitespace is rejected); matching Claude and Codex prompts count as machine work across timing views while remaining worklog evidence. Matching allows one slash-command token after whitespace, image markers, and paste wrappers.
 - Relay prefix metadata and relayed prompt counts in timing JSON, a human-readable count, and default config diagnostics in doctor that never expose config content or validation errors.
 
